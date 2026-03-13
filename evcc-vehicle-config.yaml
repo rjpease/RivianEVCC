@@ -1,0 +1,74 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# evcc-vehicle-config.yaml
+#
+# For YAML-based EVCC installs: merge these sections into your evcc.yaml.
+#
+# For UI-based EVCC installs (newer versions): see evcc-ui-charger.yaml and
+# evcc-ui-vehicle.yaml instead.
+#
+# Because the Tesla Wall Connector has no third-party current-control API,
+# EVCC adjusts the Rivian's charging rate via the Rivian charging-schedule API.
+# The bridge acts as BOTH the vehicle plugin (SoC) AND the charger plugin
+# (current control).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── 1. Charger plugin ────────────────────────────────────────────────────────
+chargers:
+  - name: rivian-bridge
+    type: custom
+
+    # Current charging status (A=not connected, B=connected, C=charging)
+    status:
+      source: http
+      uri: http://localhost:7071/charger/status
+
+    # Is charging currently enabled?
+    enabled:
+      source: http
+      uri: http://localhost:7071/charger/enabled
+
+    # Read and set charging current (amps)
+    # Note: maxcurrent handles both reading and writing in EVCC custom chargers.
+    # Use method/body to enable writing. Do NOT use setcurrent — it is invalid.
+    maxcurrent:
+      source: http
+      uri: http://localhost:7071/charger/current
+      method: POST
+      body: '{{.maxcurrent}}'
+
+    # Enable / disable charging
+    enable:
+      source: http
+      uri: http://localhost:7071/charger/enable
+      method: POST
+      body: '{{.enable}}'
+
+
+# ── 2. Vehicle plugin ────────────────────────────────────────────────────────
+vehicles:
+  - name: rivian
+    type: custom
+    title: Rivian
+    icon: car
+    capacity: 140 # kWh
+
+    soc:
+      source: http
+      uri: http://localhost:7071/soc
+
+    status:
+      source: http
+      uri: http://localhost:7071/status
+
+    range:
+      source: http
+      uri: http://localhost:7071/range
+
+
+# ── 3. Loadpoint ─────────────────────────────────────────────────────────────
+loadpoints:
+  - title: Garage
+    charger: rivian-bridge
+    vehicle: rivian
+    mincurrent: 8
+    maxcurrent: 48

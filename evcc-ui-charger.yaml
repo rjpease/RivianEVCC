@@ -1,0 +1,31 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# evcc-ui-charger.yaml
+#
+# Paste this into the EVCC UI when adding a custom charger.
+# (Devices → Chargers → Add → Custom)
+#
+# Do NOT include this file in evcc.yaml — it is for the UI config dialog only.
+# Do NOT add a "title:" key or a "chargers:" wrapper; the UI handles those.
+# ─────────────────────────────────────────────────────────────────────────────
+
+status:
+  source: http
+  uri: http://localhost:7071/charger/status
+
+enabled:
+  source: http
+  uri: http://localhost:7071/charger/enabled
+
+# maxcurrent handles both reading and setting the charge current.
+# Do NOT use setcurrent — it is not a valid key.
+maxcurrent:
+  source: http
+  uri: http://localhost:7071/charger/current
+  method: POST
+  body: '{{.maxcurrent}}'
+
+enable:
+  source: http
+  uri: http://localhost:7071/charger/enable
+  method: POST
+  body: '{{.enable}}'

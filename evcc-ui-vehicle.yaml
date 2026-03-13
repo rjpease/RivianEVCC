@@ -1,0 +1,25 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# evcc-ui-vehicle.yaml
+#
+# Paste this into the EVCC UI when adding a custom vehicle.
+# (Devices → Vehicles → Add → Custom)
+#
+# Do NOT include this file in evcc.yaml — it is for the UI config dialog only.
+# Do NOT add a "vehicles:" wrapper; paste only the content below.
+# ─────────────────────────────────────────────────────────────────────────────
+
+title: Rivian
+icon: car
+capacity: 140 # kWh
+
+soc:
+  source: http
+  uri: http://localhost:7071/soc
+
+status:
+  source: http
+  uri: http://localhost:7071/status
+
+range:
+  source: http
+  uri: http://localhost:7071/range
