@@ -30,6 +30,7 @@ import logging
 import sys
 import threading
 import time
+from datetime import datetime, timedelta
 
 from flask import Flask, request, jsonify
 from config import Config
@@ -75,6 +76,38 @@ def _background_refresher():
 
 
 threading.Thread(target=_background_refresher, daemon=True).start()
+
+# ---------------------------------------------------------------------------
+# Background noon job — shifts the off-peak disable window to 6AM
+# ---------------------------------------------------------------------------
+
+def _noon_window_shifter():
+    """
+    At noon each day, if charging is currently disabled (off-peak window),
+    re-apply the disable schedule so the window shifts to 6AM (past) rather
+    than 6PM (future), preventing accidental evening charging.
+    """
+    while True:
+        now = datetime.now()
+        next_noon = now.replace(hour=12, minute=0, second=0, microsecond=0)
+        if now >= next_noon:
+            next_noon += timedelta(days=1)
+        sleep_secs = (next_noon - now).total_seconds()
+        logger.info('Noon window shifter: sleeping %.0f seconds until %s', sleep_secs, next_noon)
+        time.sleep(sleep_secs)
+        logger.info('Noon window shifter: checking if disable window needs shifting...')
+        with _refresh_lock:
+            try:
+                if rivian.get_current_amps() == 0:
+                    logger.info('Noon window shifter: charging disabled — shifting window to 6AM')
+                    rivian.set_charge_amps(0)
+                else:
+                    logger.info('Noon window shifter: charging active — no action needed')
+            except Exception as e:
+                logger.error('Noon window shifter failed: %s', e)
+
+
+threading.Thread(target=_noon_window_shifter, daemon=True).start()
 
 # ---------------------------------------------------------------------------
 # Flask app

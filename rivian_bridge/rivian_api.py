@@ -265,7 +265,7 @@ class RivianAPI:
     def set_charge_amps(self, amps):
         """
         Set charging rate.
-          amps = 0        → disable charging (off-hours schedule trick)
+          amps = 0        → disable charging via off-hours 1-hour window
           amps = 8..48    → charge at that rate via 24h schedule
         """
         amps = int(amps)
