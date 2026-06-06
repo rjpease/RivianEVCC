@@ -31,7 +31,7 @@ class RivianAPI:
         # Cached vehicle state (populated by refresh())
         self.charging_status = None
         self.battery_level = None
-        self.distance_to_empty_km = None
+        self.distance_to_empty_mi = None
 
         self.login()
 
@@ -178,10 +178,10 @@ class RivianAPI:
 
         dte = state.get('distanceToEmpty')
         if dte:
-            self.distance_to_empty_km = round(dte['value'])
+            self.distance_to_empty_mi = round(dte['value'] / 1.60934)
 
-        logger.info('Refreshed: status=%s soc=%.1f%% range=%s km',
-                    self.charging_status, self.battery_level, self.distance_to_empty_km)
+        logger.info('Refreshed: status=%s soc=%.1f%% range=%s mi',
+                    self.charging_status, self.battery_level, self.distance_to_empty_mi)
 
     def get_soc(self):
         return self.battery_level
@@ -197,8 +197,8 @@ class RivianAPI:
             return 'B'
         return 'A'
 
-    def get_range_km(self):
-        return self.distance_to_empty_km
+    def get_range_mi(self):
+        return self.distance_to_empty_mi
 
     def is_charging(self):
         return self.charging_status == self.STATUS_CONNECTED_CHARGING
