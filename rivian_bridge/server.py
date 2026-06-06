@@ -12,7 +12,7 @@ Rivian charging schedule instead.
 Vehicle endpoints  (polled by EVCC vehicle plugin)
   GET  /soc              → integer 0–100
   GET  /status           → "A" | "B" | "C"
-  GET  /range            → integer miles
+  GET  /range            → integer km
 
 Charger endpoints  (called by EVCC charger plugin)
   GET  /charger/status   → "A" | "B" | "C"
@@ -131,7 +131,7 @@ def status():
 
 @app.get('/range')
 def range_km():
-    value = rivian.get_range_mi()
+    value = rivian.get_range_km()
     if value is None:
         return jsonify({'error': 'Range not available'}), 503
     return str(value)
@@ -198,7 +198,7 @@ def health():
         'status': 'ok',
         'soc': rivian.get_soc(),
         'evcc_status': rivian.get_evcc_status(),
-        'range_mi': rivian.get_range_mi(),
+        'range_km': rivian.get_range_km(),
         'rivian_charging_status': rivian.charging_status,
         'charger_enabled': rivian.get_current_amps() >= rivian.AMPS_MIN,
         'charger_current_amps': rivian.get_current_amps(),
