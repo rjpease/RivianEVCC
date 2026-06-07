@@ -53,7 +53,7 @@ class RivianAPI:
         return h
 
     def _post(self, url, request):
-        return requests.post(url, headers=self._headers(), json=request)
+        return requests.post(url, headers=self._headers(), json=request, timeout=20)
 
     def init_session(self):
         logger.info('Initializing new Rivian session...')
