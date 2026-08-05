@@ -4,30 +4,33 @@ Status: **proposed, not implemented.** No code changes have been made.
 
 This plan comes out of an audit of `rivian_bridge/`, the EVCC config snippets, and
 the deployment files. Findings keep the numbering used in the audit so they can be
-cross-referenced.
+cross-referenced; #23 was added afterward.
 
 ---
 
 ## Design principle (governs the whole plan)
 
 The Rivian API supports **enable/disable as a first-class operation**. Charging
-schedules exist to manage the **charging rate**, which is what lets EVCC track
-surplus solar.
+Rivian has **no start/stop charging command**. The charging schedule is the only
+lever, and a schedule is a *permissive window*: the car charges when the current
+time falls inside an enabled window, at that window's amperage.
 
-These are two separate concerns and the current code conflates them:
+Both EVCC operations therefore map onto schedule edits, and the existing code
+already uses the right primitive for each:
 
-| Concern | Correct mechanism | What the code does today |
+| EVCC operation | Schedule edit | Status |
 |---|---|---|
-| Enable / disable charging | The API's real disable | Writes an *enabled* 48A schedule at a time that isn't "now" |
-| Charge rate (solar surplus) | Schedule `amperage` on a 24h window | Correct — keep this |
+| Set rate (solar surplus) | 24h window (`startTime: 0`, `duration: 1440`) at the requested amperage | Correct — keep |
+| Disable | A window placed so that "now" falls outside it | Right idea, broken maintenance |
 
-Every P0 below follows from separating them. Rate control via a 24-hour schedule
-stays exactly as it is; only the disable path changes.
+> **Do not "fix" the disable path by sending `enabled: false`.** Clearing the
+> restriction is expected to let the car charge freely whenever it is plugged in
+> — the opposite of a disable. An earlier draft of this plan recommended exactly
+> that; it was wrong. See open question 1.
 
-**Verify before implementing:** confirm which disable the account/firmware
-actually honors — schedule `enabled: false`, or a dedicated start/stop charging
-mutation. Do not guess. Capture the working request/response in the PR
-description so the next person doesn't have to rediscover it.
+So Phase 1 is **not** a mechanism change. The mechanism is correct. What is
+broken is that the parked window is left where it will eventually arrive, at the
+highest amperage the charger supports.
 
 ---
 
@@ -36,11 +39,13 @@ description so the next person doesn't have to rediscover it.
 The bug the last two commits were chasing. Ship this phase alone if nothing else
 ships.
 
-### 1. "Disabled" is actually a scheduled 48A charge
+### 1. The parked "disable" window eventually arrives, at 48A
 `rivian_api.py:265-286`
 
-`set_charge_amps(0)` writes `"enabled": True` with `"amperage": AMPS_MAX`, moved to
-a time that isn't now. The car really does charge at 48A when the window arrives.
+`set_charge_amps(0)` writes `"enabled": True` with `"amperage": AMPS_MAX` at a
+time that isn't now. Placing the window away from now is the correct way to stop
+charging on this API — but the window is then left alone, and time moves toward
+it. When it arrives, the car really does charge at 48A for an hour.
 
 | EVCC disables at | Window written | Outcome |
 |---|---|---|
@@ -48,23 +53,41 @@ a time that isn't now. The car really does charge at 48A when the window arrives
 | 12:30 | 06:00 tomorrow | shifter already ran today; next run 12:00 tomorrow → charges 06:00 tomorrow at 48A |
 
 Any overnight "disabled" state ends in an unattended 48A hour. The noon shifter
-cannot close this — it always runs after the 6AM window it is meant to prevent.
+cannot close this — it always runs *after* the 6AM window it is meant to prevent.
 
-**Fix:** `enable_charging(False)` calls the real disable. Delete the
-`amps == 0` branch of `set_charge_amps` entirely; `set_charge_amps` becomes
-rate-only and rejects 0 rather than reinterpreting it as a disable.
+**Fix — two independent changes:**
 
-**Verification:** disable via EVCC, confirm in the Rivian app that no enabled
-schedule remains, and leave it overnight to confirm no 6AM charge.
+1. **Keep the window far from now.** Compute the parked window as
+   `now + 12h (mod 24h)` and re-apply it on a cadence well under that margin
+   (see #3). The window is then never within ~11h of firing while the bridge is
+   running, instead of drifting into range.
+2. **Park at `AMPS_MIN`, not `AMPS_MAX`.** The amperage of a window that is
+   never supposed to fire should be the least damaging value, not the most. If
+   the bridge dies while disabled, the worst case becomes one hour at 8A rather
+   than 48A. This is the defense-in-depth half of the fix and is worth landing
+   even on its own — it is a one-line change.
 
-### 3. Noon shifter is removed by the above
+**Verification:** disable via EVCC; confirm in the Rivian app that the window
+sits ~12h out at 8A, watch it get re-parked on schedule, and confirm across the
+following morning that no charge occurs.
+
+### 3. Noon shifter runs on the wrong cadence
 `server.py:84-109`
 
-It exists only to relocate the fake disable window. With a real disable there is
-nothing to shift. Removing it also removes the read-then-write race in #4.
+The intent is right and the thread should stay — with the permissive-window
+model, *something* has to keep re-parking the window. The defect is that it runs
+once per day at noon, which is structurally too late for a 06:00 window, and it
+only ever chooses between two fixed slots (18:00 / 06:00).
 
-**Fix:** delete `_noon_window_shifter` and its thread. Note the removal in the
-README so the behavior change is visible to existing users.
+**Fix:** replace the once-daily noon trigger with a periodic re-park — every
+30–60 min, well inside the 12h margin from #1. Drop the `last_shift_date`
+day-latch and the hardcoded 18:00/06:00 pair; recompute `now + 12h` each time
+and re-apply only when the stored window has drifted meaningfully closer.
+`_apply_schedule`'s unchanged-schedule short-circuit already suppresses
+redundant writes, but confirm it does (see #23) or the re-park loop becomes a
+write every cycle.
+
+Rename it to something that says what it does — `_disable_window_keepalive`.
 
 ### 4. Schedule writes race with EVCC
 `server.py:98-106` vs `161-190`
@@ -73,23 +96,46 @@ The shifter holds `_refresh_lock` around read-then-write; no Flask handler takes
 that lock, and Flask serves requests threaded. A `POST /charger/current` landing
 at 12:00:xx can be clobbered, or clobber, depending on interleaving.
 
-**Fix:** mostly resolved by deleting the shifter. Keep the residual protection:
-a dedicated `_schedule_lock` around every read-modify-write of the schedule, held
-across the `get_schedules()` → compare → write sequence in `_apply_schedule`.
-Do not reuse `_refresh_lock` — vehicle-state refresh and schedule writes should
-not block each other.
+This one gets **worse**, not better, under the corrected design: the keepalive in
+#3 fires every 30–60 min instead of once a day, so the read-modify-write window
+overlaps EVCC traffic far more often. A keepalive re-park that interleaves with a
+`POST /charger/current` can silently revert EVCC's enable.
 
-### 2. Reported state contradicts reality during the disable window
+**Fix:** a dedicated `_schedule_lock` held across the entire
+`get_schedules()` → compare → write sequence in `_apply_schedule`, and across the
+keepalive's read-then-write. Do not reuse `_refresh_lock` — vehicle-state refresh
+and schedule writes should not block each other. The keepalive must also re-read
+state inside the lock rather than acting on a value read before acquiring it.
+
+### 2. Reported state contradicts reality if the window does fire
 `server.py:148-158`, `rivian_api.py:227-236`
 
-While the fake window is live the car is charging, but `get_current_amps()` only
-counts `duration == 1440`, so `/charger/enabled` reports `false` and
+If the parked window ever arrives, the car is charging but `get_current_amps()`
+only counts `duration == 1440`, so `/charger/enabled` reports `false` and
 `/charger/current` reports `0` while `/charger/status` reports `C`. EVCC reads
 that as out-of-sync and fights it.
 
-**Fix:** falls out of #1 — once disable is real, "charging" and "enabled" can no
-longer disagree. Add a regression test asserting `status == C` implies
+#1 makes this rare rather than impossible — the window still exists, it is just
+kept away from now. So this needs its own fix rather than falling out.
+
+**Fix:** derive `enabled` from whether an enabled window actually covers the
+current time, not from `duration == 1440`. That is the honest question for a
+permissive-window API, and it answers correctly for both the 24h window and a
+parked one. Add a regression test asserting `status == C` implies
 `enabled == true`.
+
+### 23. `enabled: false` on a schedule is read as "not charging"
+`rivian_api.py:234`
+
+`get_current_amps()` requires `s.get('enabled', False)` and returns `0`
+otherwise. Under the permissive-window model a disabled schedule imposes no
+restriction, so the car is free to charge — the bridge would report
+`enabled: false` while the car charges at full rate. Reachable today if the owner
+toggles the schedule off in the Rivian app.
+
+**Fix:** covered by the #2 rewrite — "does an enabled window cover now?" — but
+call out the inverted case explicitly in a test, and log a warning when the
+bridge finds its schedule disabled underneath it.
 
 ### 14. Schedule writes replace the entire schedule list
 `rivian_api.py:247-252`
@@ -300,13 +346,22 @@ and document `--workers 1` if a production WSGI server is recommended.
 
 ## Open questions to resolve before coding
 
-1. **Which disable does the API expose?** Schedule `enabled: false`, or a
-   dedicated start/stop mutation? Phase 1 depends on the answer; everything else
-   is independent of it.
-2. **Is `distanceToEmpty` km or miles?** Needs one real-vehicle reading (#11).
-3. **Does EVCC ever send `maxcurrent: 0`,** or is disable always routed through
+1. **Confirm the permissive-window model.** This plan assumes: a schedule
+   *permits* charging inside its window, and `enabled: false` (or no schedule at
+   all) means no restriction, so the car charges freely when plugged in. That
+   assumption drives all of Phase 1, and the opposite reading inverts #1, #2 and
+   #23. Confirm with one deliberate test on the car — set `enabled: false` while
+   plugged in and observe whether charging starts — before writing any code.
+2. **Is there an upper bound on how far out a window can be parked?** #1 assumes
+   `now + 12h` is freely settable. If Rivian normalizes or rejects certain
+   offsets, the margin shrinks and the keepalive cadence in #3 has to tighten.
+3. **What does the car do while plugged in with no schedule covering now** —
+   idle at `B`, or draw nothing but report `C`? Determines the expected status
+   during a normal disabled period, and therefore what #2's test asserts.
+4. **Is `distanceToEmpty` km or miles?** Needs one real-vehicle reading (#11).
+5. **Does EVCC ever send `maxcurrent: 0`,** or is disable always routed through
    `enable`? Determines whether `set_charge_amps(0)` should raise or no-op.
-4. **Should the bridge preserve user schedules (#14),** or is "the bridge owns
+6. **Should the bridge preserve user schedules (#14),** or is "the bridge owns
    the schedule list" acceptable if documented? Preserving is more work and more
    failure modes.
 
@@ -314,7 +369,10 @@ and document `--workers 1` if a production WSGI server is recommended.
 
 ## Suggested sequencing
 
-1. **Phase 1** — the actual reported problem. Small, self-contained, shippable alone.
+0. **#1 part 2 alone** — park the disable window at `AMPS_MIN` instead of
+   `AMPS_MAX`. One line, no design questions attached, and it caps the blast
+   radius of every other bug here at 8A. Worth landing immediately.
+1. **Rest of Phase 1** — the actual reported problem, gated on open question 1.
 2. **Phase 2** — hardening; the `_gql` helper (#5) is the keystone and should land first within the phase.
 3. **Phase 4 #19** — the port fix is a one-line-per-file change that unblocks Docker users; can be pulled forward and shipped independently at any time.
 4. **Phase 3**, then the rest of **Phase 4**.
@@ -324,6 +382,10 @@ and document `--workers 1` if a production WSGI server is recommended.
 - Unit tests with a mocked GraphQL transport covering: `data: null` + `errors`,
   HTTP 500, timeout, MFA login response, and empty vehicle list. Every one of
   these currently crashes or silently misreports.
-- A state-consistency test asserting `status == C` implies `enabled == true`.
+- A state-consistency test asserting `status == C` implies `enabled == true`,
+  and its inverse for #23 (schedule disabled underneath the bridge).
+- A clock-driven test for the keepalive (#3): advance time across many cycles
+  while "disabled" and assert the parked window never comes within a threshold
+  of now, including across a midnight wrap.
 - Manual, on the real vehicle, before declaring #1 fixed: disable via EVCC and
   confirm across the following morning that no 6AM charge occurs.
