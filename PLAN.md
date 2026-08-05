@@ -3,49 +3,70 @@
 Status: **proposed, not implemented.** No code changes have been made.
 
 This plan comes out of an audit of `rivian_bridge/`, the EVCC config snippets, and
-the deployment files. Findings keep the numbering used in the audit so they can be
-cross-referenced; #23 was added afterward.
+the deployment files, checked against EVCC source and the unofficial Rivian API
+documentation. Findings keep their original numbering; #23–#26 were added during
+verification.
+
+---
+
+## What was verified against sources
+
+Everything below was checked rather than inferred. Sources are listed at the end.
+
+### EVCC (read from `evcc-io/evcc` source)
+
+| Claim | Verdict |
+|---|---|
+| `maxcurrent` is an **IntSetter** (write-only); `enabled` is the BoolGetter, `enable` the BoolSetter, `status` a StringGetter parsed by `api.ChargeStatusString` | Confirmed — the repo's claim that "maxcurrent handles both reading and setting" is **false** (#20) |
+| EVCC **never calls `MaxCurrent(0)`** — `setLimit` guards on `current >= effMinCurrent` and routes disable through `Enable(false)` | Confirmed — resolves an open question (#16) |
+| If `Enabled()` returns an error, the loadpoint update aborts for that cycle | Confirmed — failing loudly is the correct, safe behavior (#13) |
+| If the charger reports `enabled == false` while `lp.charging()`, EVCC logs **"charger logic error: disabled but charging"** and force-corrects | Confirmed — this is exactly the state the parked window produces (#2) |
+| Otherwise EVCC **adopts** the charger's reported state via `setAndPublishEnabled` | Confirmed — so a spurious `false` from a failed API call really does flip EVCC's state (#13) |
+| Status `A` = not connected, `B` = connected not charging, `C` = charging | Confirmed |
+
+### Rivian (unofficial API docs + community reports)
+
+| Claim | Verdict |
+|---|---|
+| `InputChargingSchedule` = `{weekDays, startTime, duration, location{latitude,longitude}, amperage, enabled}`; `setChargingSchedules` returns `{success}` | Confirmed — the bridge never reads `success` (#15) |
+| **There is no reachable start/stop charging command for this bridge** | Confirmed with a nuance — see #26 |
+| **Schedules are permissive windows.** Schedule on = charging restricted to the window; toggle off = the car charges immediately on plug-in | Confirmed by owner reports of exactly that behavior |
+| **Schedules are geofenced** to the schedule's `location`, and the match is fragile — owners report GPS off by ~50 ft causing the car to ignore the schedule and charge immediately | Confirmed — this is a new P0, see #24/#25 |
+| `distanceToEmpty` is in **kilometers**, not miles | Confirmed — see #11 |
 
 ---
 
 ## Design principle (governs the whole plan)
 
-The Rivian API supports **enable/disable as a first-class operation**. Charging
-Rivian has **no start/stop charging command**. The charging schedule is the only
-lever, and a schedule is a *permissive window*: the car charges when the current
-time falls inside an enabled window, at that window's amperage.
-
-Both EVCC operations therefore map onto schedule edits, and the existing code
-already uses the right primitive for each:
+For this bridge, the charging schedule is the only available lever, and a
+schedule **permits** charging rather than blocking it: the car charges when the
+current time falls inside an enabled window whose location matches where the car
+is parked.
 
 | EVCC operation | Schedule edit | Status |
 |---|---|---|
 | Set rate (solar surplus) | 24h window (`startTime: 0`, `duration: 1440`) at the requested amperage | Correct — keep |
 | Disable | A window placed so that "now" falls outside it | Right idea, broken maintenance |
 
-> **Do not "fix" the disable path by sending `enabled: false`.** Clearing the
-> restriction is expected to let the car charge freely whenever it is plugged in
-> — the opposite of a disable. An earlier draft of this plan recommended exactly
-> that; it was wrong. See open question 1.
+> **Do not "fix" the disable path by sending `enabled: false`.** That clears the
+> restriction, and the car charges freely on plug-in — the opposite of a disable.
+> An earlier draft of this plan recommended exactly that; it was wrong, and owner
+> reports of the app's toggle behaving this way confirm it.
 
-So Phase 1 is **not** a mechanism change. The mechanism is correct. What is
+Phase 1 is therefore **not** a mechanism change. The mechanism is right. What is
 broken is that the parked window is left where it will eventually arrive, at the
-highest amperage the charger supports.
+highest amperage the charger supports — and that the window may not apply at all
+(#24).
 
 ---
 
 ## Phase 1 — Charging control correctness (P0)
 
-The bug the last two commits were chasing. Ship this phase alone if nothing else
-ships.
-
 ### 1. The parked "disable" window eventually arrives, at 48A
 `rivian_api.py:265-286`
 
 `set_charge_amps(0)` writes `"enabled": True` with `"amperage": AMPS_MAX` at a
-time that isn't now. Placing the window away from now is the correct way to stop
-charging on this API — but the window is then left alone, and time moves toward
-it. When it arrives, the car really does charge at 48A for an hour.
+time that isn't now, then leaves it while time advances toward it.
 
 | EVCC disables at | Window written | Outcome |
 |---|---|---|
@@ -53,101 +74,114 @@ it. When it arrives, the car really does charge at 48A for an hour.
 | 12:30 | 06:00 tomorrow | shifter already ran today; next run 12:00 tomorrow → charges 06:00 tomorrow at 48A |
 
 Any overnight "disabled" state ends in an unattended 48A hour. The noon shifter
-cannot close this — it always runs *after* the 6AM window it is meant to prevent.
+cannot close this — it always runs *after* the 06:00 window it targets.
 
 **Fix — two independent changes:**
 
-1. **Keep the window far from now.** Compute the parked window as
-   `now + 12h (mod 24h)` and re-apply it on a cadence well under that margin
-   (see #3). The window is then never within ~11h of firing while the bridge is
-   running, instead of drifting into range.
-2. **Park at `AMPS_MIN`, not `AMPS_MAX`.** The amperage of a window that is
-   never supposed to fire should be the least damaging value, not the most. If
-   the bridge dies while disabled, the worst case becomes one hour at 8A rather
-   than 48A. This is the defense-in-depth half of the fix and is worth landing
-   even on its own — it is a one-line change.
+1. **Keep the window far from now.** Compute it as `now + 12h (mod 24h)` and
+   re-apply on a cadence well under that margin (#3), so it never approaches
+   firing while the bridge runs.
+2. **Park at `AMPS_MIN`, not `AMPS_MAX`.** A window that should never fire has no
+   business being set to the charger's maximum. If the bridge dies while
+   disabled, the worst case becomes one hour at 8A rather than 48A. One line,
+   no design questions attached.
 
-**Verification:** disable via EVCC; confirm in the Rivian app that the window
-sits ~12h out at 8A, watch it get re-parked on schedule, and confirm across the
-following morning that no charge occurs.
+### 24. The disable may not apply at all — empty `location`
+`rivian_api.py:278-286`, `rivian_api.py:238-244`
+
+Schedules are geofenced. `set_charge_amps` hardcodes `"location": {}`, and
+`_apply_schedule` only overwrites it when `get_schedules()` returns a non-empty
+list. So on a fresh account, after a failed schedule read, or any time the list
+comes back empty, the bridge submits a schedule with **no location** — which the
+car is unlikely to match against, leaving the "disable" with no effect while the
+bridge reports `enabled: false`.
+
+This is the same end state as #1 but reachable immediately rather than overnight.
+
+**Fix:** obtain a real location and never submit an empty one. Options, in order
+of preference: read it from the existing schedule (current behavior when it
+works); fall back to a `charge-location` lat/long in `config.json`; refuse to
+write and surface an error rather than submitting a geofence-less schedule.
+Treat "no location available" as a hard failure of the disable path, not a
+default.
+
+### 25. The disable is best-effort by construction
+`rivian_api.py` (design-level)
+
+Even with a correct location, owners report the car ignoring its schedule when
+GPS drifts ~50 ft, and charging immediately. The bridge cannot guarantee the car
+will not charge; it can only make it unlikely.
+
+**Fix:** this one is documentation and defense in depth, not code.
+- The `AMPS_MIN` parking in #1 is what caps the cost when the geofence fails.
+- Say plainly in the README that EVCC "off" is not a hard stop, and that anyone
+  relying on this to avoid peak rates should also set a Rivian-side charge limit.
+- Consider a guard: if the bridge believes charging is disabled but `/status`
+  reports `C` across consecutive polls, log an error and re-assert the schedule.
 
 ### 3. Noon shifter runs on the wrong cadence
 `server.py:84-109`
 
-The intent is right and the thread should stay — with the permissive-window
-model, *something* has to keep re-parking the window. The defect is that it runs
-once per day at noon, which is structurally too late for a 06:00 window, and it
-only ever chooses between two fixed slots (18:00 / 06:00).
+The intent is right and the thread should stay — something has to keep re-parking
+the window. The defect is that it runs once per day at noon, structurally too
+late for a 06:00 window, and only ever picks between two fixed slots.
 
-**Fix:** replace the once-daily noon trigger with a periodic re-park — every
-30–60 min, well inside the 12h margin from #1. Drop the `last_shift_date`
-day-latch and the hardcoded 18:00/06:00 pair; recompute `now + 12h` each time
-and re-apply only when the stored window has drifted meaningfully closer.
-`_apply_schedule`'s unchanged-schedule short-circuit already suppresses
-redundant writes, but confirm it does (see #23) or the re-park loop becomes a
-write every cycle.
-
-Rename it to something that says what it does — `_disable_window_keepalive`.
+**Fix:** replace the once-daily trigger with a periodic re-park every 30–60 min,
+well inside the 12h margin. Drop the `last_shift_date` day-latch and the
+hardcoded 18:00/06:00 pair; recompute `now + 12h` each cycle and re-apply when
+the stored window has drifted closer. Confirm `_apply_schedule`'s unchanged-check
+actually suppresses redundant writes (#27) or this becomes a write every cycle.
+Rename to `_disable_window_keepalive`.
 
 ### 4. Schedule writes race with EVCC
 `server.py:98-106` vs `161-190`
 
-The shifter holds `_refresh_lock` around read-then-write; no Flask handler takes
-that lock, and Flask serves requests threaded. A `POST /charger/current` landing
-at 12:00:xx can be clobbered, or clobber, depending on interleaving.
-
-This one gets **worse**, not better, under the corrected design: the keepalive in
-#3 fires every 30–60 min instead of once a day, so the read-modify-write window
-overlaps EVCC traffic far more often. A keepalive re-park that interleaves with a
+Worse under the corrected design: a keepalive firing every 30–60 min overlaps
+EVCC traffic far more often than a daily job, and a re-park interleaved with
 `POST /charger/current` can silently revert EVCC's enable.
 
-**Fix:** a dedicated `_schedule_lock` held across the entire
+**Fix:** a dedicated `_schedule_lock` held across the whole
 `get_schedules()` → compare → write sequence in `_apply_schedule`, and across the
-keepalive's read-then-write. Do not reuse `_refresh_lock` — vehicle-state refresh
-and schedule writes should not block each other. The keepalive must also re-read
-state inside the lock rather than acting on a value read before acquiring it.
+keepalive's read-then-write. Do not reuse `_refresh_lock`. The keepalive must
+re-read state inside the lock rather than acting on a value read before it.
 
-### 2. Reported state contradicts reality if the window does fire
+### 2. Reported state contradicts reality if the window fires
 `server.py:148-158`, `rivian_api.py:227-236`
 
-If the parked window ever arrives, the car is charging but `get_current_amps()`
-only counts `duration == 1440`, so `/charger/enabled` reports `false` and
-`/charger/current` reports `0` while `/charger/status` reports `C`. EVCC reads
-that as out-of-sync and fights it.
+If the parked window arrives (or the geofence fails, #24/#25), the car charges
+while `get_current_amps()` returns `0` — because it only counts
+`duration == 1440` — so `/charger/enabled` says `false` and `/charger/status`
+says `C`. Verified against EVCC source, this triggers
+`"charger logic error: disabled but charging"` and a force-correct.
 
-#1 makes this rare rather than impossible — the window still exists, it is just
-kept away from now. So this needs its own fix rather than falling out.
+#1 makes this rarer, not impossible, so it needs its own fix.
 
-**Fix:** derive `enabled` from whether an enabled window actually covers the
-current time, not from `duration == 1440`. That is the honest question for a
-permissive-window API, and it answers correctly for both the 24h window and a
-parked one. Add a regression test asserting `status == C` implies
-`enabled == true`.
+**Fix:** derive `enabled` from whether an enabled window whose location matches
+actually covers the current time — the honest question for a permissive-window
+API — rather than from `duration == 1440`. Answers correctly for the 24h window
+and a parked one alike.
 
 ### 23. `enabled: false` on a schedule is read as "not charging"
 `rivian_api.py:234`
 
 `get_current_amps()` requires `s.get('enabled', False)` and returns `0`
-otherwise. Under the permissive-window model a disabled schedule imposes no
-restriction, so the car is free to charge — the bridge would report
-`enabled: false` while the car charges at full rate. Reachable today if the owner
-toggles the schedule off in the Rivian app.
+otherwise. Under the confirmed permissive model a disabled schedule imposes no
+restriction, so the car is free to charge — the bridge reports `enabled: false`
+while the car charges at full rate. Reachable today by toggling the schedule off
+in the Rivian app.
 
-**Fix:** covered by the #2 rewrite — "does an enabled window cover now?" — but
-call out the inverted case explicitly in a test, and log a warning when the
-bridge finds its schedule disabled underneath it.
+**Fix:** covered by the #2 rewrite, but test the inverted case explicitly and log
+a warning when the bridge finds its own schedule disabled underneath it.
 
 ### 14. Schedule writes replace the entire schedule list
 `rivian_api.py:247-252`
 
 `chargingSchedules: [schedule]` deletes any other schedule the owner set in the
 Rivian app, on the first EVCC current change. `get_current_amps()` likewise only
-ever inspects `schedules[0]`.
+inspects `schedules[0]`.
 
-**Fix:** identify the bridge's own schedule (a stable marker — dedicated
-`startTime`/`duration` signature, or persisted index) and preserve the others in
-the submitted list. Log loudly when a pre-existing schedule is found so users
-learn the bridge is now sharing the list.
+**Fix:** identify the bridge's own schedule by a stable marker and preserve the
+rest. Log when a pre-existing schedule is found.
 
 ---
 
@@ -156,144 +190,148 @@ learn the bridge is now sharing the list.
 ### 5. GraphQL errors return HTTP 200 with `data: null`
 `rivian_api.py:96, 111, 171, 225`
 
-The `status_code != 200` guards miss this shape entirely. Confirmed failure mode
-for each site:
+The `status_code != 200` guards miss this shape. Reproduced each:
 
 - `:171` `refresh()` → `AttributeError: 'NoneType' object has no attribute 'get'`
 - `:225` `get_schedules()` → `TypeError: 'NoneType' object is not subscriptable`
-- `:111` `init_user_info()` → `TypeError` (the `except (KeyError, IndexError)` does not cover it)
+- `:111` `init_user_info()` → `TypeError` (its `except (KeyError, IndexError)` does not cover it)
 - `:96` `init_session()` → `TypeError`
 
-Because `rivian.refresh()` at `server.py:56` runs at import with no `try`, any of
-these kills the process at startup instead of logging.
+`rivian.refresh()` at `server.py:56` runs at import with no `try`, so any of these
+kills the process at startup.
 
-**Fix:** one `_gql(operation, variables, query)` helper that owns the whole
-contract — timeout, status check, `errors` check, `data is not None` check — and
-raises a typed `RivianAPIError`. Route all five call sites through it. Wrap the
-startup refresh so the bridge boots degraded (serving 503s) instead of dying.
+**Fix:** one `_gql(operation, variables, query)` helper owning timeout, status
+check, `errors` check, `data is not None` check, raising a typed
+`RivianAPIError`. Route all call sites through it. Wrap the startup refresh so
+the bridge boots degraded (serving 503s) rather than dying.
 
 ### 6. MFA login raises instead of directing to the OTP script
 `rivian_api.py:96`, `RivianSessionInitOTP.py:75`
 
 The query handles `MobileMFALoginResponse { otpToken }` but the code
-unconditionally reads `userSessionToken` → `KeyError` for any MFA-enabled
-account. The intended `'Run RivianSessionInitOTP.py'` message at `:132` is
-unreachable — the exception escapes `login()` and `__init__`. Mirrored in the OTP
-script, which assumes MFA is always required and breaks on the non-MFA path.
+unconditionally reads `userSessionToken` → `KeyError` for any MFA account,
+escaping `login()` and `__init__` and making the intended "run
+RivianSessionInitOTP.py" message at `:132` unreachable. Mirrored in the OTP
+script, which assumes MFA is always required.
 
-**Fix:** branch on `__typename` in both files. On `MobileMFALoginResponse`, log
-the actionable message and leave the bridge unauthenticated-but-alive.
+**Fix:** branch on `__typename` in both files.
 
 ### 7. No HTTP timeouts anywhere
 `rivian_api.py:56, 60`
 
 No `timeout=` on any `requests.post`. A hung connection stalls the refresh thread
-indefinitely *while it holds `_refresh_lock`*, and pins Flask threads on the
-charger endpoints.
+indefinitely *while holding `_refresh_lock`* and pins Flask threads.
 
-**Fix:** `(connect, read)` timeout on a module-level `requests.Session` (which
-also gets connection reuse). Default ~(5, 15)s, configurable.
+**Fix:** `(connect, read)` timeout on a module-level `requests.Session`.
 
 ### 8. Session tokens never re-authenticate; stale data served forever
 `rivian_api.py:118-132, 147-185`
 
 `login()` runs once in the constructor. On expiry `refresh()` logs and returns
-forever, and never clears `charging_status` / `battery_level` — so EVCC keeps
-receiving stale-but-plausible SoC and status indefinitely.
+forever, never clearing `charging_status` / `battery_level`, so EVCC keeps
+receiving stale-but-plausible values.
 
-**Fix:** detect auth failure, re-run `login()` once, retry the call. Separately,
-stamp every cached field with its fetch time and treat data older than
-`N × cache_ttl` as absent.
+**Fix:** detect auth failure, re-login once, retry. Stamp cached fields with
+fetch time and treat data older than `N × cache_ttl` as absent.
 
 ### 9. Unknown state is served as "unplugged"
 `rivian_api.py:190-199`, `server.py:127, 142`
 
-`get_evcc_status()` falls through to `'A'` when `charging_status is None`. EVCC
-reads A as disconnected and terminates the session. `/soc` already 503s correctly
-in this situation.
+`get_evcc_status()` falls through to `'A'` when `charging_status is None`; EVCC
+reads A as disconnected and ends the session. `/soc` already 503s correctly.
 
-**Fix:** return `None` for unknown and have both status endpoints 503, matching
-`/soc`.
+**Fix:** return `None` for unknown and 503 from both status endpoints.
 
 ### 13. API failure is indistinguishable from "disabled"
 `rivian_api.py:230`
 
 `get_schedules()` returns `None` on error → `get_current_amps()` returns `0` →
-EVCC sees "disabled" and tries to re-enable. Transient errors become schedule
-writes.
+EVCC adopts "disabled" (verified: `setAndPublishEnabled`) and re-enables next
+cycle. Transient errors become schedule writes.
 
-**Fix:** propagate the error (once #5 lands, this is automatic) and 503 rather
-than reporting a confident `0`.
+**Fix:** propagate the error and 503. Verified as safe: EVCC aborts that
+loadpoint cycle on an `Enabled()` error rather than thrashing.
 
 ### 10. Client-name mismatch between the OTP script and the bridge
 `RivianSessionInitOTP.py:32` vs `rivian_api.py:49`
 
-The session is minted as `com.rivian.ios.consumer-apollo-ios` and then used as
-`com.rivian.android.consumer`. Rivian binds sessions to the client, so a session
-created by the documented flow may be rejected by the bridge.
+Session minted as `com.rivian.ios.consumer-apollo-ios`, used as
+`com.rivian.android.consumer`.
 
-**Fix:** single shared constant for client name and User-Agent, used by both.
+**Fix:** one shared constant for client name and User-Agent.
 
 ---
 
 ## Phase 3 — Data correctness (P2)
 
-### 11. Range is probably double-converted
+### 11. Range is double-converted — confirmed
 `rivian_api.py:179-182`
 
-The comment claims miles and multiplies by 1.60934; Rivian's `distanceToEmpty`
-appears to be kilometers already, which would make EVCC show ~1.6× the real
-range.
+The comment claims miles and multiplies by 1.60934. The Rivian API is metric:
 
-**Fix:** verify against the in-car display before touching. Then either drop the
-conversion or fix the comment — and state which was true in the commit message.
+- Documented sample: `distanceToEmpty: 307` with `batteryLevel: 59.4` → full-scale
+  517. As **km** that is 517 km / 321 mi, right for an R1T. As **miles** it would
+  be 517 mi / 832 km, well beyond any Rivian.
+- `vehicleMileage: 14517537` is meters (14,518 km).
+- The live-charging session field is `kilometersChargedPerHour`.
+
+EVCC also works in km internally, so the value needs no conversion at all.
+
+**Fix:** drop the multiplication, fix the comment. Still worth one glance at the
+in-car display to confirm before shipping.
 
 ### 12. Every EVCC poll makes live Rivian API calls
 `rivian_api.py:227-236`, `server.py:195-206`
 
 Vehicle state is cached; schedules are not. `/charger/enabled` and
 `/charger/current` each hit the API, `_apply_schedule` fetches again before
-writing, and `/health` calls `get_current_amps()` twice. At EVCC's default
-cadence that is several calls per 30s against an unofficial API, with network
-latency inside EVCC's control loop.
+writing, `/health` calls `get_current_amps()` twice.
 
 **Fix:** cache the schedule alongside vehicle state, invalidated on every
-successful write. `/health` computes once and reuses.
+successful write. `/health` computes once.
 
 ### 15. Write success is never checked
 `rivian_api.py:260-263`
 
-HTTP 200 is logged as "updated successfully" without reading
-`data.setChargingSchedules.success` or `errors`. Failed writes report as
-successes.
+HTTP 200 is logged as success without reading `setChargingSchedules.success` —
+which the API does return — or `errors`.
 
-**Fix:** check `success`; raise otherwise. Subsumed by the `_gql` helper in #5.
+**Fix:** check `success`; raise otherwise. Subsumed by `_gql` (#5).
+
+### 27. Unchanged-schedule check is unreliable
+`rivian_api.py:238-244`
+
+`schedule == schedules[0]` compares a locally built dict against the API's
+response. Any difference in `weekDays` ordering, numeric type, or an extra
+returned field makes it always-unequal, turning the keepalive (#3) into a write
+every cycle.
+
+**Fix:** compare field-by-field on a normalized view (sorted `weekDays`, ints
+coerced) rather than whole-dict equality.
 
 ### 16. `int(float(body))` isn't fully guarded
 `server.py:184`
 
-`"inf"` raises `OverflowError`, which `except ValueError` misses → 500. No range
-validation before `set_charge_amps`.
+`"inf"` raises `OverflowError`, missed by `except ValueError` → 500.
 
 **Fix:** catch `(ValueError, OverflowError)`, validate against
-`AMPS_MIN..AMPS_MAX`, 400 on out-of-range.
+`AMPS_MIN..AMPS_MAX`, 400 on out-of-range. Note EVCC never sends 0 here
+(verified), so a 0 body indicates a misconfiguration and should 400 rather than
+being silently treated as a disable.
 
 ### 17. Silent current clamping
 `rivian_api.py:288`
 
-EVCC asking for 6A gets 8A — more current than its surplus calculation intends,
-with no feedback. `mincurrent: 8` mostly hides it today.
+EVCC asking for 6A gets 8A with no feedback.
 
-**Fix:** log at WARNING whenever a clamp occurs.
+**Fix:** log at WARNING on clamp.
 
 ### 18. First vehicle wins
 `rivian_api.py:111`
 
-`vehicles[0]['id']` with no VIN config. Multi-vehicle accounts may control the
-wrong car, and the choice can change between calls.
+`vehicles[0]['id']` with no VIN config.
 
-**Fix:** optional `vehicle-vin` in config; match on it, error clearly if absent
-and more than one vehicle exists. Keep `[0]` only for the single-vehicle case.
+**Fix:** optional `vehicle-vin` in config; error clearly when ambiguous.
 
 ---
 
@@ -303,89 +341,104 @@ and more than one vehicle exists. Keep `[0]` only for the single-vehicle case.
 
 7070: root `config-example.json`, `docker-compose.yml`, `install-mac.sh:96`.
 7071: `rivian_bridge/config-example.json`, README, all three EVCC YAML snippets.
+Under Docker this is a hard failure — the container listens on 7071 while compose
+publishes `7070:7070`.
 
-Under Docker this is a hard failure — the copied example listens on 7071 while
-compose publishes `7070:7070`. `install-mac.sh:22` also points users at the root
-example, which is the 7070 one.
+**Fix:** standardize on **7071**; delete the duplicate root `config-example.json`.
 
-**Fix:** standardize on **7071** (six of nine references, and what the working
-EVCC snippets use). Delete the duplicate root `config-example.json` so there is
-one source of truth.
-
-### 20. Docs claim `maxcurrent` is readable
+### 20. Docs claim `maxcurrent` is readable — confirmed wrong
 `evcc-ui-charger.yaml:19`, `evcc-vehicle-config.yaml:31`, `README.md:152`
 
-In EVCC's custom charger, `maxcurrent` is a write-only setter; `enabled` is the
-read side. `GET /charger/current` is never called by EVCC.
+Verified against EVCC source: `maxcurrent` is an IntSetter. `GET /charger/current`
+is never called by EVCC.
 
-**Fix:** correct the comments. Keep the GET endpoint, documented as
-debugging-only.
+**Fix:** correct the comments; keep the GET endpoint as debugging-only. The
+surrounding advice ("do not use `setcurrent`", "no `title:` in the UI body") is
+correct and should stay.
+
+### 26. START_CHARGING / STOP_CHARGING exist but are out of reach
+`rivian_api.py` (design-level)
+
+Worth recording so it is not rediscovered: `rivian-python-client` defines
+`START_CHARGING` and `STOP_CHARGING` under `sendVehicleCommand`. They are **not**
+usable here — that path requires HMAC signing with an enrolled phone key
+(`vasPhoneId`, `deviceId`, private key), a different auth model than the session
+tokens this bridge holds. They are also one-shot commands, not a persistent
+state, so even with enrollment the schedule would remain the right tool for a
+durable disable.
+
+**Fix:** none. Document as a rejected alternative.
 
 ### 21. Unauthenticated control on `0.0.0.0`
 `server.py:215`, `docker-compose.yml`
 
-Anyone on the LAN can `POST /charger/enable` and `/charger/current` to control
-the car, and `/health` discloses vehicle state. Credentials sit in plaintext
-`config.json`.
+Anyone on the LAN can control the car's charging; `/health` discloses vehicle
+state; credentials sit in plaintext `config.json`.
 
-**Fix:** default the bind address to `127.0.0.1` (EVCC runs on the same host in
-the documented setup), configurable for the Docker case. Document that exposing
-the port means exposing unauthenticated car control.
+**Fix:** default the bind to `127.0.0.1`, configurable for Docker. Document the
+exposure.
 
 ### 22. Module-level threads under a real WSGI server
 `server.py:56-109`
 
-Login, initial refresh, and the background threads run at import, so a
-multi-worker deployment gets N copies racing on the same schedule. `app.run()` is
-the Flask dev server.
+Bootstrap runs at import, so multi-worker deployments get N keepalives racing on
+one schedule — worse now that the keepalive is frequent.
 
-**Fix:** move bootstrap behind an explicit init guarded for single-worker use,
-and document `--workers 1` if a production WSGI server is recommended.
+**Fix:** guard bootstrap for single-worker use; document `--workers 1`.
 
 ---
 
-## Open questions to resolve before coding
+## Remaining open questions
 
-1. **Confirm the permissive-window model.** This plan assumes: a schedule
-   *permits* charging inside its window, and `enabled: false` (or no schedule at
-   all) means no restriction, so the car charges freely when plugged in. That
-   assumption drives all of Phase 1, and the opposite reading inverts #1, #2 and
-   #23. Confirm with one deliberate test on the car — set `enabled: false` while
-   plugged in and observe whether charging starts — before writing any code.
-2. **Is there an upper bound on how far out a window can be parked?** #1 assumes
-   `now + 12h` is freely settable. If Rivian normalizes or rejects certain
-   offsets, the margin shrinks and the keepalive cadence in #3 has to tighten.
-3. **What does the car do while plugged in with no schedule covering now** —
-   idle at `B`, or draw nothing but report `C`? Determines the expected status
-   during a normal disabled period, and therefore what #2's test asserts.
-4. **Is `distanceToEmpty` km or miles?** Needs one real-vehicle reading (#11).
-5. **Does EVCC ever send `maxcurrent: 0`,** or is disable always routed through
-   `enable`? Determines whether `set_charge_amps(0)` should raise or no-op.
-6. **Should the bridge preserve user schedules (#14),** or is "the bridge owns
-   the schedule list" acceptable if documented? Preserving is more work and more
-   failure modes.
+Most of the original list is now answered. What is left needs the car, not docs:
+
+1. **Is there an upper bound on how far ahead a window can be parked?** #1 assumes
+   `now + 12h` is freely settable. If Rivian normalizes or rejects some offsets,
+   the keepalive cadence in #3 must tighten.
+2. **What does the car report while plugged in with no window covering now** —
+   `B`, or `C` at zero power? Determines what #2's test asserts.
+3. **Does a schedule with an empty `location` get rejected, ignored, or applied
+   globally?** (#24) Changes whether the fix is "fall back to configured
+   lat/long" or "hard-fail the write".
+4. **Should the bridge preserve the owner's other schedules (#14),** or is
+   "the bridge owns the schedule list" acceptable if documented?
 
 ---
 
 ## Suggested sequencing
 
-0. **#1 part 2 alone** — park the disable window at `AMPS_MIN` instead of
-   `AMPS_MAX`. One line, no design questions attached, and it caps the blast
-   radius of every other bug here at 8A. Worth landing immediately.
-1. **Rest of Phase 1** — the actual reported problem, gated on open question 1.
-2. **Phase 2** — hardening; the `_gql` helper (#5) is the keystone and should land first within the phase.
-3. **Phase 4 #19** — the port fix is a one-line-per-file change that unblocks Docker users; can be pulled forward and shipped independently at any time.
-4. **Phase 3**, then the rest of **Phase 4**.
+0. **#1 part 2 alone** — park the disable window at `AMPS_MIN`. One line, no open
+   questions, caps the blast radius of every other bug here at 8A. Land now.
+1. **#24 + #25** — a disable that silently does nothing is worse than one that
+   fires late. Ranks with #1.
+2. **Rest of Phase 1.**
+3. **Phase 2** — `_gql` (#5) is the keystone; land it first within the phase.
+4. **#19** — one line per file, unblocks Docker users; pull forward any time.
+5. **Phase 3**, then the rest of **Phase 4**.
 
 ## Testing
 
-- Unit tests with a mocked GraphQL transport covering: `data: null` + `errors`,
-  HTTP 500, timeout, MFA login response, and empty vehicle list. Every one of
-  these currently crashes or silently misreports.
-- A state-consistency test asserting `status == C` implies `enabled == true`,
-  and its inverse for #23 (schedule disabled underneath the bridge).
-- A clock-driven test for the keepalive (#3): advance time across many cycles
-  while "disabled" and assert the parked window never comes within a threshold
-  of now, including across a midnight wrap.
-- Manual, on the real vehicle, before declaring #1 fixed: disable via EVCC and
-  confirm across the following morning that no 6AM charge occurs.
+- Unit tests with a mocked GraphQL transport: `data: null` + `errors`, HTTP 500,
+  timeout, MFA login response, empty vehicle list. Each currently crashes or
+  misreports.
+- State-consistency test: `status == C` implies `enabled == true`, plus the
+  inverted #23 case.
+- Clock-driven keepalive test (#3): advance time across many cycles while
+  disabled and assert the parked window never comes within a threshold of now,
+  including across a midnight wrap.
+- Normalization test for #27: an API response whose `weekDays` are reordered must
+  compare equal and produce no write.
+- On the real vehicle before declaring #1/#24 fixed: disable via EVCC, confirm in
+  the Rivian app that the window is ~12h out at 8A **with a real location**, and
+  confirm across the following morning that no charge occurs.
+
+## Sources
+
+- EVCC custom charger plugin keys and setter/getter types — `evcc-io/evcc`, `charger/charger.go`
+- EVCC `setLimit` / `syncCharger` behavior — `evcc-io/evcc`, `core/loadpoint.go`
+- EVCC charge status A/B/C — `evcc-io/evcc`, `api` package
+- Rivian charging schedule schema and `success` response — RivDocs, `app/legacy/charging/charging-schedule`
+- Rivian `GetVehicleState` sample values (`distanceToEmpty`, `vehicleMileage`, `chargerStatus`) — RivDocs, `app/legacy/vehicle-state`
+- Rivian `sendVehicleCommand` command list and HMAC/phone-key requirement — RivDocs, `app/legacy/controls/send-vehicle-command`
+- `START_CHARGING` / `STOP_CHARGING` command names — `bretterer/rivian-python-client`, `src/rivian/const.py`
+- Schedule geofencing and toggle-off behavior — Rivian owner forum reports
