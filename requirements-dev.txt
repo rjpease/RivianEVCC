@@ -1,0 +1,5 @@
+# Test-only dependencies. Install alongside rivian_bridge/requirements.txt:
+#   python3 -m venv .venv && . .venv/bin/activate
+#   pip install -r rivian_bridge/requirements.txt -r requirements-dev.txt
+#   pytest
+pytest>=7.0,<10

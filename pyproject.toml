@@ -1,0 +1,12 @@
+[tool.pytest.ini_options]
+# rivian_bridge/ is the application's working directory at runtime (server.py
+# imports `config` and `rivian_api` as top-level modules), so tests import them
+# the same way.
+pythonpath = ["rivian_bridge"]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "baseline: pins behaviour that is currently CORRECT and must not change",
+    "defect: pins behaviour that is currently WRONG; update only alongside the named fix",
+    "charging: touches charging control; a failure here means charging behaviour moved",
+]
