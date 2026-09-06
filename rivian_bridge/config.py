@@ -11,4 +11,4 @@ class Config:
         # EVCC will also cache based on its own 'cache' setting.
         self.cache_ttl = int(data.get('cache-ttl-seconds', 300))
         # Port the HTTP bridge listens on
-        self.port = int(data.get('bridge-port', 7070))
+        self.port = int(data.get('bridge-port', 7071))

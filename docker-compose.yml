@@ -7,7 +7,7 @@ services:
       # Expose the bridge port so EVCC can reach it.
       # If EVCC runs in Docker on the same host, you can use the container
       # name instead of localhost — see README for details.
-      - "7070:7070"
+      - "7071:7071"
     volumes:
       - ./rivian_bridge/config.json:/app/config.json:ro
       - ./rivian_bridge/rivian-session.json:/app/rivian-session.json
