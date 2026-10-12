@@ -138,6 +138,7 @@ class RivianAPI:
                 'userSessionToken': self.user_session_token,
                 'csrfToken': self.csrf_token,
             }, f)
+        os.chmod(self.session_file, 0o600)  # holds Rivian session tokens
         logger.info('Session persisted to %s', self.session_file)
 
     # ------------------------------------------------------------------

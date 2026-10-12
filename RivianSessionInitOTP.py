@@ -11,6 +11,7 @@ running inside the container).
 """
 
 import json
+import os
 import sys
 import uuid
 import requests
@@ -102,6 +103,7 @@ def main():
     }
     with open(SESSION_FILE, 'w') as f:
         json.dump(session, f, indent=2)
+    os.chmod(SESSION_FILE, 0o600)  # holds Rivian session tokens
 
     print(f'Session saved to {SESSION_FILE}')
 
