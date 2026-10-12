@@ -144,7 +144,9 @@ def _noon_window_shifter():
             continue
         target = '6AM' if now.hour >= 12 else '6PM'
         logger.info('Window shifter: checking if disable window needs moving to %s...', target)
-        with _refresh_lock:
+        # Hold the schedule lock across the read and the write, so an EVCC
+        # enable can't land in between and be overwritten (CH-002).
+        with _refresh_lock, rivian.schedule_lock:
             try:
                 # A failed read would look like "disabled" to get_current_amps()
                 # and trigger a write with an empty location (E-003). Retry instead.

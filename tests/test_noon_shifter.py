@@ -232,3 +232,52 @@ def test_a_graphql_read_error_is_retried(run_shifter, server_gateway):
 
     assert server_gateway.calls_for('SetChargingSchedule') == []
     assert len(server_gateway.calls_for('GetChargingSchedule')) == 4
+
+
+# ---------------------------------------------------------------------------
+# The shifter holds the schedule lock across read and write (CH-002)
+# ---------------------------------------------------------------------------
+
+def test_an_evcc_enable_during_a_shift_is_not_overwritten(run_shifter,
+                                                          car_keeps_writes,
+                                                          monkeypatch):
+    """C-007 / CB-5: EVCC enables charging while the shifter is between its
+    read ("charging is off") and its write (re-park the window). The enable
+    must wait, then land last, so charging ends up enabled."""
+    import _thread
+    import threading
+
+    import rivian_api
+    import server
+
+    car_keeps_writes.set_schedules(_window_at(18 * 60))
+    inner = rivian_api.requests.post
+    started = {'done': None}
+
+    def post(url, headers=None, json=None, **kwargs):
+        op = (json or {}).get('operationName')
+        if op == 'GetChargingSchedule' and started['done'] is None:
+            # The shifter's first read: EVCC's enable arrives right now.
+            started['done'] = threading.Event()
+
+            def evcc_enable():
+                try:
+                    server.rivian.enable_charging(True)
+                finally:
+                    started['done'].set()
+
+            _thread.start_new_thread(evcc_enable, ())
+            # Give the enable every chance to run now. Without the lock it
+            # completes here, before the shifter's write; with the lock it
+            # can't start until the shifter is done.
+            started['done'].wait(0.3)
+        return inner(url, headers=headers, json=json, **kwargs)
+
+    monkeypatch.setattr(rivian_api.requests, 'post', post)
+
+    run_shifter([12, 13])
+
+    assert started['done'].wait(2), 'the EVCC enable never completed'
+    written = car_keeps_writes.schedules_written()
+    assert [w[0]['duration'] for w in written] == [60, 1440], \
+        'expected the shifter park, then the EVCC enable, in that order'
