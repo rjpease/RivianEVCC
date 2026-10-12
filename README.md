@@ -134,6 +134,7 @@ status:
 enabled:
   source: http
   uri: http://localhost:7071/charger/enabled
+  cache: 55s   # < 60s; see evcc-ui-charger.yaml
 
 maxcurrent:
   source: http
@@ -193,6 +194,7 @@ chargers:
     enabled:
       source: http
       uri: http://localhost:7071/charger/enabled
+      cache: 55s   # < 60s; see evcc-ui-charger.yaml
     maxcurrent:
       source: http
       uri: http://localhost:7071/charger/current
