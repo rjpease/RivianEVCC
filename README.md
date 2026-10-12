@@ -278,6 +278,19 @@ launchctl unload ~/Library/LaunchAgents/com.rivian.evcc.bridge.plist
 rm ~/Library/LaunchAgents/com.rivian.evcc.bridge.plist
 ```
 
+## Deploying updates
+
+Merge changes into `main` on GitHub, then run this from the live checkout (the folder the LaunchAgent runs):
+
+```bash
+./deploy.sh --check   # pre-flight only: shows what would deploy, changes nothing
+./deploy.sh           # fast-forward to origin/main, restart, verify, roll back on failure
+```
+
+`deploy.sh` refuses to run unless the checkout is on `main` with no local edits and `origin/main` is a fast-forward. It also refuses outside 12:05–23:45: a restart before noon parks the charging window at 18:00 until the noon flip, and one near midnight could collide with the midnight flip.
+
+After restarting it waits for the bridge's start-up line, a successful first window-shifter tick, and `/health` reporting `"stale": false`. If any of those fail, it restores the previous commit and restarts on it. Every run is recorded in `~/Library/Logs/rivian-evcc-bridge/deploy.log`.
+
 ## Running manually (no LaunchAgent)
 
 ```bash
