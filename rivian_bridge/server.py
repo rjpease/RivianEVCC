@@ -51,12 +51,32 @@ logger = logging.getLogger(__name__)
 # Bootstrap
 # ---------------------------------------------------------------------------
 
-config = Config('config.json')
+try:
+    config = Config('config.json')
+except Exception as e:
+    # Permanent until a human fixes it. Pause so launchd's KeepAlive doesn't
+    # restart us every few seconds.
+    logger.critical('Cannot load config.json: %r', e)
+    time.sleep(60)
+    sys.exit(1)
+
+# Never fails on Rivian problems (C-005): if Rivian can't be reached or the
+# session is rejected, the bridge still starts, reports stale/auth in /health,
+# and the background refresher keeps trying the stored session.
 rivian = RivianAPI(config, session_file='rivian-session.json')
+
+
+def _initial_refresh():
+    try:
+        return bool(rivian.vehicle_id) and rivian.refresh()
+    except Exception as e:
+        logger.error('Initial refresh failed: %r', e)
+        return False
+
 
 # Only a successful refresh counts as fresh data (C-009). If Rivian is failing
 # at startup the data is stale from the start.
-_last_refresh = time.time() if rivian.refresh() else 0.0
+_last_refresh = time.time() if _initial_refresh() else 0.0
 _refresh_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
@@ -110,6 +130,10 @@ def _background_refresher():
         logger.info('Background refresh: fetching Rivian vehicle state...')
         with _refresh_lock:
             try:
+                # Not connected (startup failure or rejected session): retry
+                # with the stored session only — never a password login.
+                if not rivian.vehicle_id and not rivian.reconnect():
+                    continue
                 if rivian.refresh():
                     _last_refresh = time.time()
             except Exception as e:
@@ -141,7 +165,7 @@ def _noon_window_shifter():
         time.sleep(60)
         now = datetime.now()
         half_day = (now.date(), now.hour >= 12)
-        if half_day == last_done:
+        if half_day == last_done or not rivian.vehicle_id:
             continue
         target = '6AM' if now.hour >= 12 else '6PM'
         logger.info('Window shifter: checking if disable window needs moving to %s...', target)
@@ -289,8 +313,10 @@ def health():
         'evcc_status': rivian.get_evcc_status(),
         'range_km': rivian.get_range_km(),
         'rivian_charging_status': rivian.charging_status,
-        'charger_enabled': rivian.get_current_amps() >= rivian.AMPS_MIN,
-        'charger_current_amps': rivian.get_current_amps(),
+        'auth': rivian.auth_state,
+        'charger_enabled': (rivian.get_current_amps() >= rivian.AMPS_MIN
+                            if rivian.vehicle_id else None),
+        'charger_current_amps': rivian.get_current_amps() if rivian.vehicle_id else None,
         'last_refresh_ago_seconds': round(_data_age()),
         'stale_after_seconds': STALE_AFTER,
     })
