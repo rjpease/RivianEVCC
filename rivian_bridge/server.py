@@ -249,12 +249,30 @@ def charger_status():
     return rivian.get_evcc_status()
 
 
+def _read_amps():
+    """Current schedule amperage, or None if Rivian couldn't be read."""
+    try:
+        return rivian.read_current_amps()
+    except Exception as e:
+        logger.error('Schedule read failed: %r', e)
+        return None
+
+
+def _rivian_error(what):
+    """502 so EVCC reports the charger as errored and retries next cycle,
+    instead of acting on a guess (CH-001 / CH-006)."""
+    logger.warning('Returning 502 to EVCC: %s', what)
+    return jsonify({'error': what}), 502
+
+
 @app.get('/charger/enabled')
 def charger_enabled():
     """True if a 24-hour charging schedule is currently active."""
     if _is_stale():
         return _stale_response()
-    amps = rivian.get_current_amps()
+    amps = _read_amps()
+    if amps is None:
+        return _rivian_error('could not read the charging schedule')
     return 'true' if amps >= rivian.AMPS_MIN else 'false'
 
 
@@ -263,7 +281,10 @@ def charger_current():
     """Return current schedule amperage (0 if disabled)."""
     if _is_stale():
         return _stale_response()
-    return str(rivian.get_current_amps())
+    amps = _read_amps()
+    if amps is None:
+        return _rivian_error('could not read the charging schedule')
+    return str(amps)
 
 
 @app.post('/charger/enable')
@@ -278,7 +299,13 @@ def charger_enable():
     body = request.get_data(as_text=True).strip().lower()
     enabled = body == 'true'
     logger.info('charger/enable called: enabled=%s', enabled)
-    rivian.enable_charging(enabled)
+    try:
+        ok = rivian.enable_charging(enabled)
+    except Exception as e:
+        logger.error('enable_charging failed: %r', e)
+        ok = False
+    if not ok:
+        return _rivian_error('charging schedule was not written')
     return ('', 204)
 
 
@@ -298,7 +325,13 @@ def set_charger_current():
         return jsonify({'error': f'Invalid current value: {body!r}'}), 400
 
     logger.info('charger/current called: amps=%d', amps)
-    rivian.set_charge_amps(amps)
+    try:
+        ok = rivian.set_charge_amps(amps)
+    except Exception as e:
+        logger.error('set_charge_amps failed: %r', e)
+        ok = False
+    if not ok:
+        return _rivian_error('charging schedule was not written')
     return ('', 204)
 
 
