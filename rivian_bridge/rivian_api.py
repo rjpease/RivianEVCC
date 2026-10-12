@@ -1,13 +1,24 @@
 # Rivian API — vehicle state reader + charging schedule controller for EVCC bridge
 # Adapted from github.com/ostap-korkuna/rivian-charging-automation
 
+import functools
 import json
 import logging
 import os
+import threading
 import requests
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+
+def _schedule_locked(method):
+    """Run `method` holding the instance's schedule lock (CH-002)."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self.schedule_lock:
+            return method(self, *args, **kwargs)
+    return wrapper
 
 
 class RivianAPI:
@@ -31,6 +42,12 @@ class RivianAPI:
         self.user_session_token = None
         self.csrf_token = None
         self.vehicle_id = None
+
+        # Serialises every charging-schedule read-modify-write, so EVCC's
+        # requests and the window shifter can't interleave between a read and
+        # the write that depends on it (C-007). Re-entrant because
+        # enable_charging -> set_charge_amps -> _apply_schedule nest.
+        self.schedule_lock = threading.RLock()
 
         # Cached vehicle state (populated by refresh())
         self.charging_status = None
@@ -228,6 +245,7 @@ class RivianAPI:
             return None
         return resp.json()['data']['getVehicle']['chargingSchedules']
 
+    @_schedule_locked
     def get_current_amps(self):
         """Return active schedule amperage, or 0 if charging is disabled."""
         schedules = self.get_schedules()
@@ -239,6 +257,7 @@ class RivianAPI:
             return s.get('amperage', 0)
         return 0
 
+    @_schedule_locked
     def _apply_schedule(self, schedule):
         """Write `schedule`. Returns True if the car now has it, else False."""
         schedules = self.get_schedules()
@@ -277,6 +296,7 @@ class RivianAPI:
             logger.error('SetChargingSchedule failed: %s', resp.text)
         return ok
 
+    @_schedule_locked
     def set_charge_amps(self, amps):
         """
         Set charging rate.
@@ -312,6 +332,7 @@ class RivianAPI:
                              "Friday", "Saturday", "Sunday"],
             })
 
+    @_schedule_locked
     def enable_charging(self, enabled: bool):
         """Enable or disable charging. When enabling, EVCC will call setcurrent immediately after."""
         if enabled:
