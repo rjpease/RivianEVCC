@@ -353,7 +353,15 @@ class RivianAPI:
     @_schedule_locked
     def get_current_amps(self):
         """Return active schedule amperage, or 0 if charging is disabled."""
+        return self.read_current_amps() or 0
+
+    @_schedule_locked
+    def read_current_amps(self):
+        """Like get_current_amps(), but None if the schedule couldn't be read,
+        so callers can tell "off" from "unknown" (CH-006)."""
         schedules = self.get_schedules()
+        if schedules is None:
+            return None
         if not schedules:
             return 0
         s = schedules[0]
@@ -418,7 +426,7 @@ class RivianAPI:
         Set charging rate.
           amps = 0        → disable charging via off-hours 1-hour window
           amps = 8..48    → charge at that rate via 24h schedule
-        For amps == 0, returns True if the car now has the window, else False.
+        Returns True if the car now has the schedule, else False (CH-001).
         """
         amps = int(amps)
 
@@ -438,7 +446,7 @@ class RivianAPI:
             })
         else:
             amps = max(self.AMPS_MIN, min(self.AMPS_MAX, amps))
-            self._apply_schedule({
+            return self._apply_schedule({
                 "startTime": 0,
                 "duration": 1440,
                 "location": {},
@@ -450,10 +458,10 @@ class RivianAPI:
 
     @_schedule_locked
     def enable_charging(self, enabled: bool):
-        """Enable or disable charging. When enabling, EVCC will call setcurrent immediately after."""
+        """Enable or disable charging. When enabling, EVCC will call setcurrent
+        immediately after. Returns True if the car now has the schedule."""
         if enabled:
             current = self.get_current_amps()
             # Restore to at least AMPS_MIN so EVCC can ramp up
-            self.set_charge_amps(current if current >= self.AMPS_MIN else self.AMPS_MIN)
-        else:
-            self.set_charge_amps(0)
+            return self.set_charge_amps(current if current >= self.AMPS_MIN else self.AMPS_MIN)
+        return self.set_charge_amps(0)

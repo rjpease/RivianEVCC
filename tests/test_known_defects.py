@@ -17,72 +17,8 @@ pytestmark = pytest.mark.defect
 
 
 # ---------------------------------------------------------------------------
-# C-003 / CB-1 — a failed write is reported to EVCC as success  [CHARGING LOGIC]
-# ---------------------------------------------------------------------------
-
-@pytest.mark.charging
-def test_http_500_on_write_is_reported_as_success(client, server_gateway):
-    """C-003: the mutation fails upstream and EVCC still gets 204.
-
-    Fixed by CH-001 (return 502). EVCC's maxcurrent is write-only, so it never
-    re-reads the value — a lost write diverges permanently.
-    """
-    server_gateway.set_response('SetChargingSchedule',
-                                {'error': 'upstream'}, status_code=500)
-
-    response = client.post('/charger/current', data='16')
-
-    assert response.status_code == 204
-
-
-@pytest.mark.charging
-def test_graphql_errors_on_write_are_reported_as_success(client, server_gateway):
-    """C-002 + C-003: GraphQL returns 200 with an errors array; only the status
-    code is checked, so this is logged as 'updated successfully'."""
-    server_gateway.set_response('SetChargingSchedule', {
-        'data': None,
-        'errors': [{'message': 'UNAUTHENTICATED', 'extensions': {'code': 401}}],
-    })
-
-    assert client.post('/charger/current', data='16').status_code == 204
-
-
-@pytest.mark.charging
-def test_success_false_is_reported_as_success(client, server_gateway):
-    """C-003: the mutation selects `{ success }` and then discards it."""
-    server_gateway.set_response('SetChargingSchedule',
-                                {'data': {'setChargingSchedules':
-                                          {'success': False}}})
-
-    assert client.post('/charger/current', data='16').status_code == 204
-
-
-@pytest.mark.charging
-def test_disable_failure_is_reported_as_success(client, server_gateway):
-    server_gateway.set_response('SetChargingSchedule',
-                                {'error': 'upstream'}, status_code=503)
-
-    assert client.post('/charger/enable', data='false').status_code == 204
-
-
-# ---------------------------------------------------------------------------
 # C-008 — an outage is indistinguishable from "charging disabled"
 # ---------------------------------------------------------------------------
-
-@pytest.mark.charging
-def test_read_failure_reports_charging_as_disabled(client, server_gateway):
-    """C-008: get_schedules() returns None on any non-200 and get_current_amps()
-    turns that into 0 — the same answer as genuinely-off. Fixed by CH-006."""
-    server_gateway.set_response('GetChargingSchedule',
-                                {'error': 'upstream'}, status_code=502)
-
-    enabled = client.get('/charger/enabled')
-    current = client.get('/charger/current')
-
-    assert enabled.status_code == 200
-    assert enabled.get_data(as_text=True) == 'false'
-    assert current.status_code == 200
-    assert current.get_data(as_text=True) == '0'
 
 
 @pytest.mark.charging
@@ -118,16 +54,6 @@ def test_null_data_on_a_schedule_read_raises_typeerror(api, gateway):
 
     with pytest.raises(TypeError):
         api.get_current_amps()
-
-
-def test_null_data_escapes_the_request_handler(client, server_gateway):
-    """C-002: the TypeError propagates out of the view. Under TESTING the test
-    client re-raises it; in production Werkzeug turns it into a 500, so EVCC
-    sees the charger error out on its polling path."""
-    server_gateway.set_response('GetChargingSchedule', {'data': None})
-
-    with pytest.raises(TypeError):
-        client.get('/charger/enabled')
 
 
 # ---------------------------------------------------------------------------
@@ -180,27 +106,6 @@ def test_non_true_enable_bodies_disable_charging(client, server_gateway, body):
     client.post('/charger/enable', data=body)
 
     assert server_gateway.last_schedule_written()['duration'] == 60
-
-
-# ---------------------------------------------------------------------------
-# E-004 — schedule fields are read without type or null validation
-# ---------------------------------------------------------------------------
-
-def test_null_amperage_is_served_verbatim_to_evcc(client, server_gateway):
-    """E-004: a present-but-null amperage becomes the literal string 'None',
-    which EVCC cannot parse as an integer."""
-    server_gateway.set_schedules([existing_schedule(None)])
-
-    assert client.get('/charger/current').get_data(as_text=True) == 'None'
-
-
-def test_null_amperage_breaks_the_enabled_endpoint(client, server_gateway):
-    """E-004: `None >= 8` raises TypeError on EVCC's polling path, which
-    production serves as a 500."""
-    server_gateway.set_schedules([existing_schedule(None)])
-
-    with pytest.raises(TypeError):
-        client.get('/charger/enabled')
 
 
 # ---------------------------------------------------------------------------
