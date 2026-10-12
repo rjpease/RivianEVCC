@@ -1,0 +1,39 @@
+# evcc CHARGE METER — Tesla Wall Connector (Gen 3) at 192.168.7.187
+# Added 2026-09-09. Paste into: evcc UI -> Configuration -> add a Meter ->
+# "User-defined device", then assign it to the "Rivian Bridge" loadpoint as its
+# charge meter.
+#
+# WHY THIS EXISTS
+# The Rivian Bridge charger reports `power x  energy x  currents x` and the
+# loadpoint showed `meters: charge x` — evcc had NO measurement of charging power
+# at all and inferred everything from the grid meter. That is why on 9 Sep the log
+# read `charge power: 0W` for the entire 06:00 session while the wall connector was
+# actually delivering 11-14.66 kW, and why evcc's `charging` flag disagreed with
+# reality. A real charge meter closes that hole.
+#
+# THE POWER EXPRESSION IS VALIDATED, NOT ASSUMED
+# It is exactly what Home Assistant's tesla_wall_connector integration computes.
+# Checked against the real 06:00 charge on 9 Sep 2026, sample by sample:
+#     06:01:07  HA 14.66 kW   computed 14.66 kW   delta +0.00
+#     06:02:37  HA 14.61 kW   computed 14.61 kW   delta -0.00
+# Every sample matched to 0.00 kW, including the peak.
+#
+# The endpoints need no authentication and answered in ~44 ms, 3/3, from the mini.
+#
+# WARNING: 192.168.7.187 is a DHCP address and this unit advertises NO mDNS name,
+# so there is no hostname to fall back on. Set a DHCP reservation on the eero.
+# Without it a lease change silently breaks BOTH this meter and HA's
+# tesla_wall_connector integration — the same failure that broke the Tapo plug.
+
+power:
+  source: http
+  uri: http://192.168.7.187/api/1/vitals
+  jq: (.voltageA_v * .currentA_a) + (.voltageB_v * .currentB_a) + (.voltageC_v * .currentC_a)
+  cache: 5s
+
+energy:
+  source: http
+  uri: http://192.168.7.187/api/1/lifetime
+  jq: .energy_wh
+  scale: 0.001
+  cache: 30s

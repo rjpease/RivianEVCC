@@ -6,3 +6,7 @@ __pycache__/
 .DS_Store
 .pytest_cache/
 .venv/
+
+# Local-only
+.claude/settings.local.json
+*.bak*
