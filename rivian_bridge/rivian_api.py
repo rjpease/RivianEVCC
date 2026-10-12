@@ -50,6 +50,14 @@ class RivianAPI:
         self.csrf_token = None
         self.vehicle_id = None
 
+        # 'ok' once a vehicle is found; 'needs_otp' if Rivian wants MFA (run
+        # RivianSessionInitOTP.py); 'failed' if Rivian rejected or couldn't be
+        # reached. Reported by /health.
+        self.auth_state = 'failed'
+        # A password login can make Rivian text an MFA code, so try it at most
+        # once per process (C-001).
+        self._password_login_tried = False
+
         # Serialises every charging-schedule read-modify-write, so EVCC's
         # requests and the window shifter can't interleave between a read and
         # the write that depends on it (C-007). Re-entrant because
@@ -89,6 +97,8 @@ class RivianAPI:
         return requests.post(url, headers=self._headers(), json=request, timeout=20)
 
     def init_session(self):
+        """Password login. Returns True on success, 'mfa' if Rivian requires
+        an MFA code (not possible unattended), False on any other failure."""
         logger.info('Initializing new Rivian session...')
         resp = requests.post(
             self.GATEWAY_URL,
@@ -97,15 +107,21 @@ class RivianAPI:
                 "operationName": "CreateCSRFToken",
                 "variables": [],
                 "query": "mutation CreateCSRFToken { createCsrfToken { __typename csrfToken appSessionToken } }"
-            }
+            },
+            timeout=20,
         )
         if resp.status_code != 200:
             logger.error('CSRF request failed: %s', resp.text)
             return False
 
-        data = resp.json()
-        self.csrf_token = data['data']['createCsrfToken']['csrfToken']
-        self.app_session_token = data['data']['createCsrfToken']['appSessionToken']
+        try:
+            csrf = resp.json()['data']['createCsrfToken']
+            csrf_token, app_session_token = csrf['csrfToken'], csrf['appSessionToken']
+        except (KeyError, TypeError, ValueError):
+            logger.error('CSRF response not understood: %s', resp.text[:300])
+            return False
+        self.csrf_token = csrf_token
+        self.app_session_token = app_session_token
 
         resp = self._post(self.GATEWAY_URL, {
             "operationName": "Login",
@@ -122,11 +138,20 @@ class RivianAPI:
             )
         })
         if resp.status_code != 200:
-            logger.error('Login failed: %s', resp.text)
+            logger.error('Login failed: %s', resp.status_code)
             return False
 
-        data = resp.json()
-        self.user_session_token = data['data']['login']['userSessionToken']
+        try:
+            result = (resp.json().get('data') or {}).get('login') or {}
+        except (ValueError, AttributeError):
+            result = {}
+        if result.get('__typename') == 'MobileMFALoginResponse' or 'otpToken' in result:
+            # C-001: an MFA account can't log in unattended. Don't crash.
+            return 'mfa'
+        if not result.get('userSessionToken'):
+            logger.error('Login response not understood (status %s)', resp.status_code)
+            return False
+        self.user_session_token = result['userSessionToken']
         logger.info('Rivian session initialized')
         return True
 
@@ -144,25 +169,80 @@ class RivianAPI:
             self.vehicle_id = resp.json()['data']['currentUser']['vehicles'][0]['id']
             logger.info('Vehicle ID: %s', self.vehicle_id)
             return True
-        except (KeyError, IndexError) as e:
-            logger.error('Failed to parse vehicle ID: %s', e)
+        except (KeyError, IndexError, TypeError, ValueError) as e:
+            logger.error('Failed to parse vehicle ID (session rejected?): %r', e)
+            return False
+
+    def _load_stored_session(self):
+        """Load tokens from the session file. Returns True if it was usable."""
+        if not os.path.exists(self.session_file):
+            return False
+        logger.info('Loading stored session from %s', self.session_file)
+        try:
+            with open(self.session_file) as f:
+                d = json.load(f)
+            self.app_session_token = d['appSessionToken']
+            self.user_session_token = d['userSessionToken']
+            self.csrf_token = d['csrfToken']
+            return True
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            logger.error('Session file %s is unreadable: %r', self.session_file, e)
             return False
 
     def login(self):
-        if os.path.exists(self.session_file):
-            logger.info('Loading stored session from %s', self.session_file)
-            with open(self.session_file) as f:
-                d = json.load(f)
-                self.app_session_token = d['appSessionToken']
-                self.user_session_token = d['userSessionToken']
-                self.csrf_token = d['csrfToken']
+        """Connect to Rivian. Never raises; returns True if a vehicle was found.
 
-        if not self.init_user_info():
-            logger.info('Stored session invalid — re-authenticating')
-            if self.init_session() and self.init_user_info():
+        Uses the stored session. A password login is tried only if Rivian
+        actively rejects that session (not on a network error), and at most
+        once per process, because on an MFA account each attempt can text a
+        code to the owner (C-001).
+        """
+        try:
+            self._load_stored_session()
+            if self.init_user_info():
+                self.auth_state = 'ok'
+                return True
+            if self._password_login_tried:
+                self.auth_state = 'failed'
+                return False
+            self._password_login_tried = True
+            logger.info('Stored session invalid — trying a password login (once)')
+            result = self.init_session()
+            if result == 'mfa':
+                self.auth_state = 'needs_otp'
+                logger.error('Rivian requires an MFA code: run RivianSessionInitOTP.py. '
+                             'The bridge picks up the new session at its next '
+                             'refresh, no restart needed.')
+                return False
+            if result is True and self.init_user_info():
                 self._persist_session()
-            else:
-                logger.error('Rivian auth failed. Run RivianSessionInitOTP.py')
+                self.auth_state = 'ok'
+                return True
+            self.auth_state = 'failed'
+            logger.error('Rivian auth failed. Run RivianSessionInitOTP.py')
+            return False
+        except requests.RequestException as e:
+            # Network not up yet (e.g. right after login): no password retry.
+            self.auth_state = 'failed'
+            logger.error('Cannot reach Rivian: %r — will retry', e)
+            return False
+        except Exception:
+            self.auth_state = 'failed'
+            logger.exception('Unexpected error connecting to Rivian — will retry')
+            return False
+
+    def reconnect(self):
+        """Retry with the stored session only — never a password login, so it
+        is safe to call repeatedly. Picks up a session written by
+        RivianSessionInitOTP.py without a restart."""
+        try:
+            if self._load_stored_session() and self.init_user_info():
+                self.auth_state = 'ok'
+                logger.info('Reconnected to Rivian')
+                return True
+        except requests.RequestException as e:
+            logger.error('Cannot reach Rivian: %r — will retry', e)
+        return False
 
     def _persist_session(self):
         with open(self.session_file, 'w') as f:
@@ -250,6 +330,8 @@ class RivianAPI:
     # ------------------------------------------------------------------
 
     def get_schedules(self):
+        if not self.vehicle_id:
+            return None                     # not connected to Rivian yet
         resp = self._post(self.GATEWAY_URL, {
             "operationName": "GetChargingSchedule",
             "variables": {"vehicleId": self.vehicle_id},

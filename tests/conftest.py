@@ -112,12 +112,17 @@ class FakeGateway:
         self.calls = []
         self._responses = {op: dict(body) for op, body in DEFAULT_RESPONSES.items()}
         self._overrides = {}
+        self._errors = {}
 
     # -- configuration ----------------------------------------------------
 
     def set_response(self, operation, payload, status_code=200):
         """Override one operation with a payload and/or non-200 status."""
         self._overrides[operation] = FakeResponse(payload, status_code)
+
+    def set_error(self, operation, exc):
+        """Make `operation` raise `exc` (e.g. requests.ConnectionError)."""
+        self._errors[operation] = exc
 
     def set_schedules(self, schedules):
         """Set what GetChargingSchedule returns."""
@@ -138,6 +143,8 @@ class FakeGateway:
             'variables': request.get('variables'),
             'kwargs': kwargs,
         })
+        if operation in self._errors:
+            raise self._errors[operation]
         if operation in self._overrides:
             return self._overrides[operation]
         if operation not in self._responses:
@@ -273,38 +280,48 @@ class _DummyThread:
 
 
 @pytest.fixture
-def server_module(monkeypatch, tmp_path, config_file, session_file):
+def server_factory(monkeypatch, tmp_path, config_file, session_file):
     """Import `server` with its module-level bootstrap driven by the stub.
 
-    server.py performs live I/O and starts two daemon threads at import time
-    (finding C-005), so it has to be imported inside a prepared environment
-    rather than at collection. When C-005 is fixed this fixture should get
-    simpler, not disappear.
+    server.py connects to Rivian and starts two daemon threads at import time,
+    so it is imported inside a prepared environment. `configure(fake)` runs
+    before the import, so a test can break Rivian for the bootstrap itself.
     """
     import threading
 
     import rivian_api
 
-    fake = FakeGateway()
-    monkeypatch.setattr(rivian_api.requests, 'post', fake.post)
-    monkeypatch.setattr(threading, 'Thread', _DummyThread)
+    def _make(configure=None):
+        fake = FakeGateway()
+        if configure:
+            configure(fake)
+        monkeypatch.setattr(rivian_api.requests, 'post', fake.post)
+        monkeypatch.setattr(threading, 'Thread', _DummyThread)
 
-    # server.py reads config.json and rivian-session.json from its cwd.
-    for name in ('config.json', 'rivian-session.json'):
-        (tmp_path / name).write_text(
-            (config_file if name == 'config.json' else session_file).read_text()
-        )
-    monkeypatch.chdir(tmp_path)
+        # server.py reads config.json and rivian-session.json from its cwd.
+        for name in ('config.json', 'rivian-session.json'):
+            (tmp_path / name).write_text(
+                (config_file if name == 'config.json' else session_file).read_text()
+            )
+        monkeypatch.chdir(tmp_path)
 
+        sys.modules.pop('server', None)
+        import server  # noqa: E402  (deliberately imported under the stub)
+
+        server.app.config['TESTING'] = True
+        server.gateway = fake
+        return server
+
+    yield _make
     sys.modules.pop('server', None)
-    import server  # noqa: E402  (deliberately imported under the stub)
 
-    server.app.config['TESTING'] = True
+
+@pytest.fixture
+def server_module(server_factory):
+    server = server_factory()
     server.rivian.last_known_location = dict(SEEN_LOCATION)
-    fake.reset()
-    server.gateway = fake
-    yield server
-    sys.modules.pop('server', None)
+    server.gateway.reset()
+    return server
 
 
 @pytest.fixture

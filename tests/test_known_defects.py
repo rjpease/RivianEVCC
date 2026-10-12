@@ -266,8 +266,8 @@ def test_runtime_requests_carry_a_timeout(api, gateway, at_clock):
     """C-004, partly fixed by 83ff63f: every call through `_post` passes
     timeout=20, which covers refresh, schedule reads and schedule writes.
 
-    Still open: `init_session` calls requests.post directly (rivian_api.py:64)
-    without a timeout, and so does RivianSessionInitOTP.py."""
+    init_session's direct CSRF call got its timeout with C-001/C-005. Still
+    open: RivianSessionInitOTP.py (interactive, run by hand)."""
     at_clock(rivian_api, hour=9)
     api.refresh()
     api.set_charge_amps(16)
