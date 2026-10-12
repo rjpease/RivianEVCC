@@ -251,18 +251,21 @@ def test_every_enabled_poll_hits_the_api(client, server_gateway):
 
 
 # ---------------------------------------------------------------------------
-# C-004 — no request timeout is ever passed
+# C-004 — request timeouts (partly fixed)
 # ---------------------------------------------------------------------------
 
-def test_no_request_carries_a_timeout(api, gateway, at_clock):
-    """C-004: requests.post() is called without `timeout=`, so a half-open
-    socket blocks the calling thread forever."""
+def test_runtime_requests_carry_a_timeout(api, gateway, at_clock):
+    """C-004, partly fixed by 83ff63f: every call through `_post` passes
+    timeout=20, which covers refresh, schedule reads and schedule writes.
+
+    Still open: `init_session` calls requests.post directly (rivian_api.py:64)
+    without a timeout, and so does RivianSessionInitOTP.py."""
     at_clock(rivian_api, hour=9)
     api.refresh()
     api.set_charge_amps(16)
 
     assert gateway.calls, 'expected outbound calls to inspect'
-    assert all('timeout' not in call['kwargs'] for call in gateway.calls)
+    assert all(call['kwargs'].get('timeout') == 20 for call in gateway.calls)
 
 
 # ---------------------------------------------------------------------------

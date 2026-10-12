@@ -15,6 +15,10 @@ class RivianAPI:
 
     AMPS_MAX = 48
     AMPS_MIN = 8
+    # Amperage of the parked 1-hour "off" window. If the window is ever not
+    # moved before it comes round, the car charges at this rate, so keep it at
+    # the minimum.
+    AMPS_PARK = AMPS_MIN
 
     # Rivian charger status values
     STATUS_CONNECTED_CHARGING = 'chrgr_sts_connected_charging'
@@ -236,12 +240,13 @@ class RivianAPI:
         return 0
 
     def _apply_schedule(self, schedule):
+        """Write `schedule`. Returns True if the car now has it, else False."""
         schedules = self.get_schedules()
         if schedules:
             schedule['location'] = schedules[0].get('location', {})
             if schedule == schedules[0]:
                 logger.info('Schedule unchanged — skipping API call')
-                return
+                return True
 
         logger.info('Applying charging schedule: %s', schedule)
         resp = self._post(self.GATEWAY_URL, {
@@ -257,16 +262,27 @@ class RivianAPI:
                 "chargingSchedules: $chargingSchedules) { success } }"
             )
         })
+        # GraphQL reports errors as HTTP 200 with data: null (C-002), so a 200
+        # alone does not mean the write landed.
+        ok = False
         if resp.status_code == 200:
+            try:
+                result = (resp.json().get('data') or {}).get('setChargingSchedules')
+                ok = result is not None and result.get('success') is not False
+            except (ValueError, AttributeError):
+                ok = False
+        if ok:
             logger.info('Charging schedule updated successfully')
         else:
             logger.error('SetChargingSchedule failed: %s', resp.text)
+        return ok
 
     def set_charge_amps(self, amps):
         """
         Set charging rate.
           amps = 0        → disable charging via off-hours 1-hour window
           amps = 8..48    → charge at that rate via 24h schedule
+        For amps == 0, returns True if the car now has the window, else False.
         """
         amps = int(amps)
 
@@ -275,11 +291,11 @@ class RivianAPI:
             # before noon → schedule at 18:00, after noon → schedule at 06:00
             current_hour = datetime.now().hour
             start_min = 18 * 60 if current_hour < 12 else 6 * 60
-            self._apply_schedule({
+            return self._apply_schedule({
                 "startTime": start_min,
                 "duration": 60,
                 "location": {},
-                "amperage": self.AMPS_MAX,
+                "amperage": self.AMPS_PARK,
                 "enabled": True,
                 "weekDays": ["Monday", "Tuesday", "Wednesday", "Thursday",
                              "Friday", "Saturday", "Sunday"],

@@ -1,12 +1,15 @@
-"""Baseline: the background job that moves the disable window past noon.
+"""Baseline: the background job that keeps the disable window >= 6 h away.
 
 `_noon_window_shifter` is an infinite loop, so these tests drive it with a
 patched `time.sleep` that advances a scripted clock and stops the loop after a
 fixed number of ticks.
 
-The job exists to stop an 18:00 disable window (written during the morning)
-from arriving that evening as a real 48 A charging hour. Its correctness is
-charging behaviour.
+The job re-parks the 1-hour disable window twice a day: to 18:00 on the first
+tick after midnight, to 06:00 on the first tick after noon (CH-011). Without
+the midnight flip, a window parked at 06:00 in the afternoon arrives the next
+morning as a real charging hour (CB-3). A half-day only counts as done once the
+window is written, so failures are retried every tick (CH-004). Its correctness
+is charging behaviour.
 """
 
 import pytest
@@ -24,12 +27,18 @@ class _LoopFinished(Exception):
 def run_shifter(server_module, monkeypatch):
     """Run `_noon_window_shifter` over a scripted sequence of clock readings.
 
-    Each element of `hours` is the local hour reported on one tick.
+    Each element of `ticks` is the local hour on one tick, or a (day, hour)
+    pair to cross midnight. The scripted clock is installed in BOTH server and
+    rivian_api: set_charge_amps(0) reads the hour itself to pick 06:00 or 18:00.
     """
     from datetime import datetime
 
-    def _run(hours, day=6):
-        readings = iter([datetime(2026, 9, day, hour, 0, 0) for hour in hours])
+    import rivian_api
+
+    def _run(ticks, day=6):
+        stamps = [datetime(2026, 9, *(t if isinstance(t, tuple) else (day, t)), 0, 0)
+                  for t in ticks]
+        readings = iter(stamps)
 
         class ScriptedDatetime(datetime):
             _current = datetime(2026, 9, day, 0, 0, 0)
@@ -45,6 +54,7 @@ def run_shifter(server_module, monkeypatch):
                 raise _LoopFinished from None
 
         monkeypatch.setattr(server_module, 'datetime', ScriptedDatetime)
+        monkeypatch.setattr(rivian_api, 'datetime', ScriptedDatetime)
         monkeypatch.setattr(server_module.time, 'sleep', advance)
 
         with pytest.raises(_LoopFinished):
@@ -53,20 +63,43 @@ def run_shifter(server_module, monkeypatch):
     return _run
 
 
-def test_no_shift_before_noon(run_shifter, server_gateway):
-    server_gateway.set_schedules([existing_schedule(48, start_time=1080,
-                                                    duration=60)])
+@pytest.fixture
+def car_keeps_writes(server_gateway, monkeypatch):
+    """Make the fake car return whatever schedule was last written to it."""
+    import rivian_api
+
+    def post(url, headers=None, json=None, **kwargs):
+        response = server_gateway.post(url, headers=headers, json=json, **kwargs)
+        if (json or {}).get('operationName') == 'SetChargingSchedule' \
+                and response.status_code == 200:
+            server_gateway.set_schedules(json['variables']['chargingSchedules'])
+        return response
+
+    monkeypatch.setattr(rivian_api.requests, 'post', post)
+    return server_gateway
+
+
+def _window_at(start_minute):
+    return [existing_schedule(8, start_time=start_minute, duration=60)]
+
+
+# ---------------------------------------------------------------------------
+# Where the window goes
+# ---------------------------------------------------------------------------
+
+def test_morning_leaves_an_evening_window_where_it_is(run_shifter, server_gateway):
+    """Before noon the target is 18:00; a window already there is not rewritten."""
+    server_gateway.set_schedules(_window_at(18 * 60))
 
     run_shifter([6, 8, 10, 11])
 
-    assert server_gateway.calls == []
+    assert server_gateway.calls_for('SetChargingSchedule') == []
 
 
 def test_shift_runs_once_after_noon(run_shifter, server_gateway):
     """Charging is disabled with the evening window, so the job rewrites it to
     06:00 — where it is already in the past."""
-    server_gateway.set_schedules([existing_schedule(48, start_time=1080,
-                                                    duration=60)])
+    server_gateway.set_schedules(_window_at(18 * 60))
 
     run_shifter([11, 12, 13, 14, 15])
 
@@ -74,6 +107,32 @@ def test_shift_runs_once_after_noon(run_shifter, server_gateway):
     assert len(written) == 1
     assert written[0][0]['startTime'] == 6 * 60
     assert written[0][0]['duration'] == 60
+    assert written[0][0]['amperage'] == 8
+
+
+def test_midnight_moves_a_morning_window_to_the_evening(run_shifter, server_gateway):
+    """CB-3 / CH-011: a window parked at 06:00 during the afternoon must not be
+    left there overnight."""
+    server_gateway.set_schedules(_window_at(6 * 60))
+
+    run_shifter([(6, 22), (6, 23), (7, 0), (7, 1), (7, 2)])
+
+    written = server_gateway.schedules_written()
+    assert len(written) == 1
+    assert written[0][0]['startTime'] == 18 * 60
+    assert written[0][0]['amperage'] == 8
+
+
+def test_window_flips_at_every_half_day(run_shifter, car_keeps_writes):
+    """Across two full days the window moves once per half-day, always to the
+    slot at least 6 h away."""
+    car_keeps_writes.set_schedules(_window_at(6 * 60))
+
+    run_shifter([(d, h) for d in (6, 7) for h in range(24)])
+
+    written = [w[0]['startTime'] for w in car_keeps_writes.schedules_written()]
+    # 6th 00:00 -> 18:00, 6th 12:00 -> 06:00, 7th 00:00 -> 18:00, 7th 12:00 -> 06:00
+    assert written == [18 * 60, 6 * 60, 18 * 60, 6 * 60]
 
 
 def test_no_shift_while_charging_is_active(run_shifter, server_gateway):
@@ -81,14 +140,23 @@ def test_no_shift_while_charging_is_active(run_shifter, server_gateway):
     when charging is already off."""
     server_gateway.set_schedules([existing_schedule(32)])
 
-    run_shifter([12, 13, 14])
+    run_shifter([0, 1, 12, 13, 14])
 
     assert server_gateway.calls_for('SetChargingSchedule') == []
 
 
+def test_charging_active_is_checked_once_per_half_day(run_shifter, server_gateway):
+    """Once a half-day is settled, later ticks in it make no API calls."""
+    server_gateway.set_schedules([existing_schedule(32)])
+
+    run_shifter([12, 13, 14, 15])
+
+    reads = server_gateway.calls_for('GetChargingSchedule')
+    assert len(reads) == 2      # one tick: get_schedules + get_current_amps
+
+
 def test_shift_happens_again_the_next_day(run_shifter, server_gateway):
-    server_gateway.set_schedules([existing_schedule(48, start_time=1080,
-                                                    duration=60)])
+    server_gateway.set_schedules(_window_at(18 * 60))
 
     run_shifter([12, 13])
     run_shifter([12, 13], day=7)
@@ -96,36 +164,71 @@ def test_shift_happens_again_the_next_day(run_shifter, server_gateway):
     assert len(server_gateway.schedules_written()) == 2
 
 
-@pytest.mark.defect
-def test_a_failed_shift_is_not_retried_that_day(run_shifter, server_gateway):
-    """Finding C-027 / CB-2.
+# ---------------------------------------------------------------------------
+# Failures are retried (CH-004, fixes C-027)
+# ---------------------------------------------------------------------------
 
-    `last_shift_date` is assigned BEFORE the try block, so one transient
-    failure marks the day done. The 18:00 window then survives into the
-    evening — exactly the unwanted charge this job was added to prevent.
-
-    Fixed by CH-004 (set the date only after success). When that lands, this
-    test should assert a retry instead.
-    """
-    server_gateway.set_schedules([existing_schedule(48, start_time=1080,
-                                                    duration=60)])
-    server_gateway.set_response('SetChargingSchedule',
-                                {'error': 'upstream'}, status_code=500)
+@pytest.mark.parametrize('payload,status', [
+    ({'error': 'upstream'}, 500),
+    ({'data': None, 'errors': [{'message': 'User is unauthenticated'}]}, 200),
+])
+def test_a_failed_shift_is_retried_every_tick(run_shifter, server_gateway,
+                                              payload, status):
+    server_gateway.set_schedules(_window_at(18 * 60))
+    server_gateway.set_response('SetChargingSchedule', payload, status_code=status)
 
     run_shifter([12, 13, 14, 15, 16, 17, 18])
 
-    # One attempt, at the first post-noon tick, and no retry despite six more
-    # opportunities before the 18:00 window arrives.
-    assert len(server_gateway.calls_for('SetChargingSchedule')) == 1
+    assert len(server_gateway.calls_for('SetChargingSchedule')) == 7
 
 
-@pytest.mark.defect
-def test_a_read_failure_also_burns_the_day(run_shifter, server_gateway):
-    """C-027 again, via the read half: get_current_amps() raising means the
-    day is marked shifted without anything having been written."""
+def test_retrying_stops_once_the_write_lands(run_shifter, car_keeps_writes,
+                                             monkeypatch):
+    """Two failed writes, then success: exactly three attempts."""
+    import rivian_api
+
+    car_keeps_writes.set_schedules(_window_at(18 * 60))
+    failures = {'left': 2}
+    inner = rivian_api.requests.post
+
+    def flaky(url, headers=None, json=None, **kwargs):
+        if (json or {}).get('operationName') == 'SetChargingSchedule' \
+                and failures['left']:
+            failures['left'] -= 1
+            car_keeps_writes.calls.append({'operation': 'SetChargingSchedule',
+                                           'variables': json['variables']})
+            from conftest import FakeResponse
+            return FakeResponse({'error': 'upstream'}, 500)
+        return inner(url, headers=headers, json=json, **kwargs)
+
+    monkeypatch.setattr(rivian_api.requests, 'post', flaky)
+
+    run_shifter([12, 13, 14, 15, 16, 17])
+
+    assert len(car_keeps_writes.calls_for('SetChargingSchedule')) == 3
+    assert car_keeps_writes.calls_for('GetChargingSchedule')[-1]  # still polled
+    final = car_keeps_writes.schedules_written()[-1][0]
+    assert final['startTime'] == 6 * 60
+
+
+def test_an_unreadable_schedule_is_retried_and_never_written(run_shifter,
+                                                             server_gateway):
+    """A non-200 read looks like "disabled" to get_current_amps(). The shifter
+    must not act on it — that would write a window with an empty location
+    (E-003) — and must try again next tick."""
+    server_gateway.set_response('GetChargingSchedule', '<html>', status_code=503)
+
+    run_shifter([12, 13, 14, 15])
+
+    assert server_gateway.calls_for('SetChargingSchedule') == []
+    assert len(server_gateway.calls_for('GetChargingSchedule')) == 4
+
+
+def test_a_graphql_read_error_is_retried(run_shifter, server_gateway):
+    """C-002: data: null makes get_schedules() raise. The half-day stays open."""
     server_gateway.set_response('GetChargingSchedule', {'data': None})
 
     run_shifter([12, 13, 14, 15])
 
     assert server_gateway.calls_for('SetChargingSchedule') == []
-    assert len(server_gateway.calls_for('GetChargingSchedule')) == 1
+    assert len(server_gateway.calls_for('GetChargingSchedule')) == 4

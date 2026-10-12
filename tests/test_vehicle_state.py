@@ -30,14 +30,13 @@ def test_refresh_asks_for_the_discovered_vehicle(api, gateway):
     assert call['variables'] == {'vehicleID': 'vehicle-id-stub'}
 
 
-@pytest.mark.defect
-def test_range_is_multiplied_by_the_miles_to_km_factor(api, gateway):
-    """Finding E-001: the code asserts distanceToEmpty is in miles and converts.
-    That claim is unverified — community clients treat the field as kilometres.
-    Pinned as current behaviour; confirm against the Rivian app before changing."""
+def test_range_is_passed_through_as_km(api, gateway):
+    """distanceToEmpty is already in km. Verified 2026-10-12 on the owner's
+    R1S (car set to imperial): /range read 451 while the Rivian app showed
+    280 mi, a ratio of 1.61. The old x1.60934 conversion double-converted."""
     api.refresh()
 
-    assert api.get_range_km() == round(250 * 1.60934)   # 402, not 250
+    assert api.get_range_km() == 250
 
 
 def test_missing_charger_status_leaves_the_cache_untouched(api, gateway):

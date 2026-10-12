@@ -70,15 +70,19 @@ def test_float_and_string_amps_are_coerced(api, gateway, at_clock):
 def test_zero_amps_parks_a_one_hour_window(api, gateway, at_clock, hour,
                                            expected_start):
     """0 A disables charging by writing a 60-minute window that does not cover
-    'now': 18:00 in the morning, 06:00 from noon onward."""
+    'now': 18:00 in the morning, 06:00 from noon onward.
+
+    The window is parked at 8 A, not 48 A (CH-008, approved 2026-10-12), so a
+    window that is somehow never moved charges at the minimum rate."""
     at_clock(rivian_api, hour=hour)
 
-    api.set_charge_amps(0)
+    assert api.set_charge_amps(0) is True
 
     written = gateway.last_schedule_written()
     assert written['startTime'] == expected_start
     assert written['duration'] == 60
-    assert written['amperage'] == rivian_api.RivianAPI.AMPS_MAX
+    assert written['amperage'] == 8
+    assert written['amperage'] == rivian_api.RivianAPI.AMPS_PARK
     assert written['enabled'] is True
     assert written['weekDays'] == ALL_WEEKDAYS
 
@@ -210,3 +214,38 @@ def test_write_sends_the_session_headers(api, gateway, at_clock):
     assert headers['a-sess'] == 'stored-app'
     assert headers['u-sess'] == 'stored-user'
     assert headers['csrf-token'] == 'stored-csrf'
+
+
+# ---------------------------------------------------------------------------
+# Did the park write land? (needed so the window shifter can retry, CH-004)
+# ---------------------------------------------------------------------------
+
+def test_park_reports_success(api, gateway, at_clock):
+    at_clock(rivian_api, hour=13)
+
+    assert api.set_charge_amps(0) is True
+
+
+def test_park_already_in_place_counts_as_success(api, gateway, at_clock):
+    """The read-compare skip writes nothing, and the car already has the
+    window, so the caller must treat it as done."""
+    at_clock(rivian_api, hour=13)
+    gateway.set_schedules([existing_schedule(8, start_time=6 * 60, duration=60)])
+
+    assert api.set_charge_amps(0) is True
+    assert gateway.calls_for('SetChargingSchedule') == []
+
+
+@pytest.mark.parametrize('payload,status', [
+    ({'error': 'upstream'}, 500),
+    ({'data': None, 'errors': [{'message': 'User is unauthenticated'}]}, 200),
+    ({'data': {'setChargingSchedules': {'success': False}}}, 200),
+    ('<html>rate limited</html>', 200),
+])
+def test_park_reports_failure(api, gateway, at_clock, payload, status):
+    """A non-200, a GraphQL error carried in a 200 (C-002), an explicit
+    success: false, or a non-JSON body all mean the window was not written."""
+    at_clock(rivian_api, hour=13)
+    gateway.set_response('SetChargingSchedule', payload, status_code=status)
+
+    assert api.set_charge_amps(0) is False
