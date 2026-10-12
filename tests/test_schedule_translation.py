@@ -122,13 +122,92 @@ def test_location_is_preserved_from_the_existing_schedule(api, gateway, at_clock
     assert gateway.last_schedule_written()['location'] == home
 
 
-def test_location_is_empty_when_the_vehicle_has_no_schedule(api, gateway, at_clock):
+# E-003: a schedule is never written without a location. If Rivian gives none
+# (failed read, no schedules, null location), the last location seen is used;
+# if none has been seen since startup, the write is refused.
+
+HOME = {'latitude': 42.8672219, 'longitude': -87.8951042}
+
+
+def _seen_home(api, gateway):
+    """A successful read that records HOME as the last known location."""
+    gateway.set_schedules([existing_schedule(16, location=HOME)])
+    api.get_current_amps()
+    gateway.reset()
+
+
+@pytest.mark.parametrize('amps', [0, 32])
+def test_no_location_and_none_seen_refuses_the_write(api, gateway, at_clock, amps):
     at_clock(rivian_api, hour=9)
+    api.last_known_location = None                 # e.g. just after startup
     gateway.set_schedules([])
+
+    result = api.set_charge_amps(amps)
+
+    assert gateway.calls_for('SetChargingSchedule') == []
+    if amps == 0:
+        assert result is False
+
+
+@pytest.mark.parametrize('amps', [0, 32])
+def test_failed_read_uses_the_last_known_location(api, gateway, at_clock, amps):
+    at_clock(rivian_api, hour=9)
+    _seen_home(api, gateway)
+    gateway.set_response('GetChargingSchedule', '<html>rate limited</html>',
+                         status_code=503)
+
+    api.set_charge_amps(amps)
+
+    assert gateway.last_schedule_written()['location'] == HOME
+
+
+def test_empty_schedule_list_uses_the_last_known_location(api, gateway, at_clock):
+    at_clock(rivian_api, hour=9)
+    _seen_home(api, gateway)
+    gateway.set_schedules([])
+
+    assert api.set_charge_amps(0) is True
+    assert gateway.last_schedule_written()['location'] == HOME
+
+
+def test_null_location_uses_the_last_known_location(api, gateway, at_clock):
+    at_clock(rivian_api, hour=9)
+    _seen_home(api, gateway)
+    gateway.set_schedules([existing_schedule(16, location=None)])
+    gateway._responses['GetChargingSchedule']['data']['getVehicle'][
+        'chargingSchedules'][0]['location'] = None
 
     api.set_charge_amps(32)
 
-    assert gateway.last_schedule_written()['location'] == {}
+    assert gateway.last_schedule_written()['location'] == HOME
+
+
+def test_last_known_location_tracks_the_latest_valid_read(api, gateway):
+    moved = {'latitude': 43.0407600, 'longitude': -87.9021912}
+    _seen_home(api, gateway)
+    gateway.set_schedules([existing_schedule(16, location=moved)])
+    api.get_current_amps()
+    assert api.last_known_location == moved
+
+    # An invalid location in a later read does not overwrite it.
+    gateway.set_schedules([existing_schedule(16, location={'latitude': None,
+                                                           'longitude': None})])
+    api.get_current_amps()
+    assert api.last_known_location == moved
+
+
+def test_no_write_ever_carries_an_empty_location(api, gateway, at_clock):
+    """Sweep the failure shapes; every write that happens has a location."""
+    at_clock(rivian_api, hour=13)
+    _seen_home(api, gateway)
+    for setup in (lambda: gateway.set_schedules([]),
+                  lambda: gateway.set_response('GetChargingSchedule',
+                                               {'error': 'x'}, status_code=500)):
+        setup()
+        for amps in (0, 8, 32):
+            api.set_charge_amps(amps)
+    for written in gateway.schedules_written():
+        assert written[0]['location'] == HOME
 
 
 # ---------------------------------------------------------------------------

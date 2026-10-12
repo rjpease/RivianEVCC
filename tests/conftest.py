@@ -234,6 +234,13 @@ def session_file(tmp_path):
     return path
 
 
+#: Where the fixtures' bridge has last seen the car's schedule. On the real
+#: car a schedule with a location always exists (the bridge always writes one),
+#: so a running bridge has always seen one. Tests of the E-003 "no location
+#: seen yet" path set `last_known_location = None` explicitly.
+SEEN_LOCATION = {'latitude': 37.7, 'longitude': -122.4}
+
+
 @pytest.fixture
 def api(gateway, config_file, session_file):
     """A logged-in RivianAPI backed by the fake gateway.
@@ -246,6 +253,7 @@ def api(gateway, config_file, session_file):
 
     instance = RivianAPI(Config(str(config_file)), session_file=str(session_file))
     assert instance.vehicle_id == 'vehicle-id-stub'
+    instance.last_known_location = dict(SEEN_LOCATION)
     gateway.reset()
     return instance
 
@@ -292,6 +300,7 @@ def server_module(monkeypatch, tmp_path, config_file, session_file):
     import server  # noqa: E402  (deliberately imported under the stub)
 
     server.app.config['TESTING'] = True
+    server.rivian.last_known_location = dict(SEEN_LOCATION)
     fake.reset()
     server.gateway = fake
     yield server
