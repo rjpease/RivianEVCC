@@ -15,6 +15,9 @@ status:
 enabled:
   source: http
   uri: http://localhost:7071/charger/enabled
+  # Caches the schedule read EVCC makes every cycle (halves Rivian API load).
+  # Keep it under 60s: EVCC re-checks charger state 60s after switching it.
+  cache: 55s
 
 # maxcurrent handles both reading and setting the charge current.
 # Do NOT use setcurrent — it is not a valid key.
