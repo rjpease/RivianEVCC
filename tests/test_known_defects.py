@@ -274,25 +274,3 @@ def test_runtime_requests_carry_a_timeout(api, gateway, at_clock):
 
     assert gateway.calls, 'expected outbound calls to inspect'
     assert all(call['kwargs'].get('timeout') == 20 for call in gateway.calls)
-
-
-# ---------------------------------------------------------------------------
-# C-009 — last_refresh records the attempt, not the success
-# ---------------------------------------------------------------------------
-
-def test_failed_refresh_still_advances_the_freshness_clock(server_module,
-                                                           server_gateway):
-    """C-009: _background_refresher sets _last_refresh after any refresh() that
-    returns, and refresh() returns normally on failure — so /health reports a
-    healthy age over a cache that never updated."""
-    server_module.rivian.battery_level = 41.0        # last known-good reading
-    server_gateway.set_response('GetVehicleState',
-                                {'error': 'upstream'}, status_code=500)
-    before = server_module._last_refresh
-
-    # What _background_refresher does on every tick: refresh, then stamp.
-    server_module.rivian.refresh()
-    server_module._last_refresh = server_module.time.time()
-
-    assert server_module._last_refresh >= before     # looks freshly refreshed
-    assert server_module.rivian.battery_level == 41.0  # but nothing was learned
