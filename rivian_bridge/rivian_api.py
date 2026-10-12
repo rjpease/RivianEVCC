@@ -179,10 +179,14 @@ class RivianAPI:
     # ------------------------------------------------------------------
 
     def refresh(self):
-        """Fetch the latest vehicle state from Rivian cloud. Updates cached fields."""
+        """Fetch the latest vehicle state from Rivian cloud. Updates cached fields.
+
+        Returns True only if new vehicle state was received, so callers can
+        tell fresh data from a failed refresh (C-009).
+        """
         if not self.vehicle_id:
             logger.error('No vehicle ID — cannot refresh')
-            return
+            return False
 
         resp = self._post(self.GATEWAY_URL, {
             "operationName": "GetVehicleState",
@@ -200,12 +204,15 @@ class RivianAPI:
 
         if resp.status_code != 200:
             logger.error('GetVehicleState failed: %s', resp.text)
-            return
+            return False
 
-        state = resp.json().get('data', {}).get('vehicleState', {})
+        # GraphQL errors (e.g. UNAUTHENTICATED) can arrive as HTTP 200 with
+        # data: null (C-002).
+        state = ((resp.json() or {}).get('data') or {}).get('vehicleState') or {}
         if state.get('chargerStatus') is None:
-            logger.warning('Vehicle state missing — possibly in service mode')
-            return
+            logger.warning('Vehicle state missing — session expired, API error '
+                           'or service mode: %s', resp.text[:300])
+            return False
 
         self.charging_status = state['chargerStatus']['value']
         self.battery_level = state['batteryLevel']['value']
@@ -216,6 +223,7 @@ class RivianAPI:
 
         logger.info('Refreshed: status=%s soc=%.1f%% range=%s km',
                     self.charging_status, self.battery_level, self.distance_to_empty_km)
+        return True
 
     def get_soc(self):
         return self.battery_level

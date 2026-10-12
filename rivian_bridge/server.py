@@ -53,9 +53,10 @@ logger = logging.getLogger(__name__)
 
 config = Config('config.json')
 rivian = RivianAPI(config, session_file='rivian-session.json')
-rivian.refresh()
 
-_last_refresh = time.time()
+# Only a successful refresh counts as fresh data (C-009). If Rivian is failing
+# at startup the data is stale from the start.
+_last_refresh = time.time() if rivian.refresh() else 0.0
 _refresh_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
@@ -109,8 +110,8 @@ def _background_refresher():
         logger.info('Background refresh: fetching Rivian vehicle state...')
         with _refresh_lock:
             try:
-                rivian.refresh()
-                _last_refresh = time.time()
+                if rivian.refresh():
+                    _last_refresh = time.time()
             except Exception as e:
                 logger.error('Background refresh failed: %s', e)
 
