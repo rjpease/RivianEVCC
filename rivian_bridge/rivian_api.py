@@ -53,7 +53,7 @@ class RivianAPI:
         return h
 
     def _post(self, url, request):
-        return requests.post(url, headers=self._headers(), json=request)
+        return requests.post(url, headers=self._headers(), json=request, timeout=20)
 
     def init_session(self):
         logger.info('Initializing new Rivian session...')
@@ -178,8 +178,7 @@ class RivianAPI:
 
         dte = state.get('distanceToEmpty')
         if dte:
-            # Rivian reports distanceToEmpty in miles — convert to km
-            self.distance_to_empty_km = round(dte['value'] * 1.60934)
+            self.distance_to_empty_km = round(dte['value'])
 
         logger.info('Refreshed: status=%s soc=%.1f%% range=%s km',
                     self.charging_status, self.battery_level, self.distance_to_empty_km)
