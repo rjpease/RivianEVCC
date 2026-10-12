@@ -12,6 +12,13 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 
+def _valid_location(location):
+    """True if `location` is a usable {latitude, longitude} pair."""
+    return (isinstance(location, dict)
+            and location.get('latitude') is not None
+            and location.get('longitude') is not None)
+
+
 def _schedule_locked(method):
     """Run `method` holding the instance's schedule lock (CH-002)."""
     @functools.wraps(method)
@@ -48,6 +55,11 @@ class RivianAPI:
         # the write that depends on it (C-007). Re-entrant because
         # enable_charging -> set_charge_amps -> _apply_schedule nest.
         self.schedule_lock = threading.RLock()
+
+        # Location of the car's schedule, as last read from Rivian. Used when a
+        # read fails just before a write, so no schedule is ever sent with an
+        # empty location (E-003).
+        self.last_known_location = None
 
         # Cached vehicle state (populated by refresh())
         self.charging_status = None
@@ -243,7 +255,10 @@ class RivianAPI:
         if resp.status_code != 200:
             logger.error('GetChargingSchedule failed: %s', resp.text)
             return None
-        return resp.json()['data']['getVehicle']['chargingSchedules']
+        schedules = resp.json()['data']['getVehicle']['chargingSchedules']
+        if schedules and _valid_location(schedules[0].get('location')):
+            self.last_known_location = dict(schedules[0]['location'])
+        return schedules
 
     @_schedule_locked
     def get_current_amps(self):
@@ -262,10 +277,21 @@ class RivianAPI:
         """Write `schedule`. Returns True if the car now has it, else False."""
         schedules = self.get_schedules()
         if schedules:
-            schedule['location'] = schedules[0].get('location', {})
+            schedule['location'] = schedules[0].get('location') or {}
             if schedule == schedules[0]:
                 logger.info('Schedule unchanged — skipping API call')
                 return True
+
+        # Never send a schedule without a location (E-003). Schedules are tied
+        # to a location, so one without may not restrict charging at all.
+        if not _valid_location(schedule['location']):
+            if self.last_known_location is None:
+                logger.error('Not writing charging schedule: no location from '
+                             'Rivian and none seen since startup (E-003)')
+                return False
+            logger.warning('No location from Rivian — using last known %s',
+                           self.last_known_location)
+            schedule['location'] = dict(self.last_known_location)
 
         logger.info('Applying charging schedule: %s', schedule)
         resp = self._post(self.GATEWAY_URL, {

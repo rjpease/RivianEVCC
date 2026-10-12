@@ -88,14 +88,22 @@ def test_read_failure_reports_charging_as_disabled(client, server_gateway):
 @pytest.mark.charging
 def test_enable_during_an_outage_writes_the_minimum(api, gateway, at_clock):
     """C-008 follow-on: enable() reads 0 from a failed query and writes 8 A —
-    a charging command provoked by an outage rather than by EVCC."""
+    a charging command provoked by an outage rather than by EVCC.
+
+    Since the E-003 fix the write carries the last known location instead of
+    an empty one (and is refused if no location has been seen yet)."""
     at_clock(rivian_api, hour=9)
+    home = {'latitude': 42.8672219, 'longitude': -87.8951042}
+    gateway.set_schedules([existing_schedule(16, location=home)])
+    api.get_current_amps()                       # a good read before the outage
     gateway.set_response('GetChargingSchedule',
                          {'error': 'upstream'}, status_code=502)
 
     api.enable_charging(True)
 
-    assert gateway.last_schedule_written()['amperage'] == 8
+    written = gateway.last_schedule_written()
+    assert written['amperage'] == 8
+    assert written['location'] == home
 
 
 # ---------------------------------------------------------------------------

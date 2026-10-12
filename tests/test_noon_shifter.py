@@ -281,3 +281,17 @@ def test_an_evcc_enable_during_a_shift_is_not_overwritten(run_shifter,
     written = car_keeps_writes.schedules_written()
     assert [w[0]['duration'] for w in written] == [60, 1440], \
         'expected the shifter park, then the EVCC enable, in that order'
+
+
+def test_a_refused_write_is_retried(run_shifter, server_module, server_gateway):
+    """E-003: with no location from Rivian and none seen since startup, the
+    park is refused (nothing written) and the half-day stays open, so the
+    shifter tries again next tick instead of marking it done."""
+    server_module.rivian.last_known_location = None
+    server_gateway.set_schedules([])
+
+    run_shifter([12, 13, 14])
+
+    assert server_gateway.calls_for('SetChargingSchedule') == []
+    # get_schedules + get_current_amps + _apply_schedule's read, every tick
+    assert len(server_gateway.calls_for('GetChargingSchedule')) == 9
