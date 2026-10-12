@@ -134,7 +134,13 @@ def _background_refresher():
                 # with the stored session only — never a password login.
                 if not rivian.vehicle_id and not rivian.reconnect():
                     continue
-                if rivian.refresh():
+                ok = rivian.refresh()
+                if (not ok and rivian.session_file_changed()
+                        and rivian.reconnect()):
+                    # The owner ran RivianSessionInitOTP.py after the session
+                    # expired: use the new session now, no restart (C-028).
+                    ok = rivian.refresh()
+                if ok:
                     _last_refresh = time.time()
             except Exception as e:
                 logger.error('Background refresh failed: %s', e)

@@ -50,10 +50,14 @@ class RivianAPI:
         self.csrf_token = None
         self.vehicle_id = None
 
-        # 'ok' once a vehicle is found; 'needs_otp' if Rivian wants MFA (run
-        # RivianSessionInitOTP.py); 'failed' if Rivian rejected or couldn't be
-        # reached. Reported by /health.
+        # 'ok' once a vehicle is found and refreshes succeed; 'expired' if
+        # Rivian rejects the session at runtime; 'needs_otp' if Rivian wants
+        # MFA (run RivianSessionInitOTP.py); 'failed' if Rivian rejected or
+        # couldn't be reached at startup. Reported by /health.
         self.auth_state = 'failed'
+        # Modification time of the session file when it was last loaded, so a
+        # new file from RivianSessionInitOTP.py can be picked up (C-028).
+        self._session_mtime = None
         # A password login can make Rivian text an MFA code, so try it at most
         # once per process (C-001).
         self._password_login_tried = False
@@ -179,6 +183,7 @@ class RivianAPI:
             return False
         logger.info('Loading stored session from %s', self.session_file)
         try:
+            self._session_mtime = os.path.getmtime(self.session_file)
             with open(self.session_file) as f:
                 d = json.load(f)
             self.app_session_token = d['appSessionToken']
@@ -229,6 +234,14 @@ class RivianAPI:
         except Exception:
             self.auth_state = 'failed'
             logger.exception('Unexpected error connecting to Rivian — will retry')
+            return False
+
+    def session_file_changed(self):
+        """True if the session file was rewritten (e.g. by
+        RivianSessionInitOTP.py) since it was last loaded."""
+        try:
+            return os.path.getmtime(self.session_file) != self._session_mtime
+        except OSError:
             return False
 
     def reconnect(self):
@@ -282,6 +295,10 @@ class RivianAPI:
             )
         })
 
+        if 'UNAUTHENTICATED' in resp.text:
+            # The session has expired (C-028). Shown as auth "expired" in
+            # /health until a new session file is picked up.
+            self.auth_state = 'expired'
         if resp.status_code != 200:
             logger.error('GetVehicleState failed: %s', resp.text)
             return False
@@ -303,6 +320,7 @@ class RivianAPI:
 
         logger.info('Refreshed: status=%s soc=%.1f%% range=%s km',
                     self.charging_status, self.battery_level, self.distance_to_empty_km)
+        self.auth_state = 'ok'
         return True
 
     def get_soc(self):
