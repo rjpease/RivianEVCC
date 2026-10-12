@@ -1,6 +1,0 @@
-{
-    "rivian-user": "your-rivian-email@example.com",
-    "rivian-pass": "your-rivian-password",
-    "cache-ttl-seconds": 300,
-    "bridge-port": 7070
-}

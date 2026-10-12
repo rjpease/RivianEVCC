@@ -288,6 +288,32 @@ python3 server.py
 
 ---
 
+## Running the tests
+
+The test suite is fully offline — it stubs the Rivian GraphQL gateway and
+refuses any real outbound request, so it never contacts Rivian and never
+touches a vehicle.
+
+```bash
+cd ~/github/RivianEVCC
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r rivian_bridge/requirements.txt -r requirements-dev.txt
+pytest
+```
+
+Tests carry markers so you can target them:
+
+```bash
+pytest -m charging   # anything that touches charging control
+pytest -m defect     # tests pinning known-wrong behaviour
+```
+
+Most tests assert the **current** behaviour on purpose. Those marked `defect`
+document a known bug and are expected to fail when that bug is fixed — update
+them deliberately as part of the fix rather than adjusting them to pass.
+
+---
+
 ## Troubleshooting
 
 ### EVCC fails to start: `cannot create circuit: missing name`
@@ -332,12 +358,16 @@ into the UI text area.
 │   ├── config-example.json    → copy to config.json and fill in
 │   ├── rivian-session.json    (generated — gitignored)
 │   └── requirements.txt
+├── tests/                     Offline regression suite (see "Running the tests")
 ├── RivianSessionInitOTP.py    One-time 2FA auth (run from project root)
 ├── install-mac.sh             macOS LaunchAgent installer
 ├── evcc-vehicle-config.yaml   evcc.yaml snippet for YAML-based installs
 ├── evcc-ui-charger.yaml       Charger config snippet for EVCC UI
 ├── evcc-ui-vehicle.yaml       Vehicle config snippet for EVCC UI
+├── requirements-dev.txt       Test-only dependencies
+├── pyproject.toml             pytest configuration
 ├── Dockerfile                 For Docker-based deployment
+├── .dockerignore              Keeps credentials out of image layers
 └── docker-compose.yml
 ```
 

@@ -59,6 +59,46 @@ _last_refresh = time.time()
 _refresh_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
+# Staleness guard
+# ---------------------------------------------------------------------------
+# The Rivian session can expire (API starts returning UNAUTHENTICATED) while the
+# last good values sit happily in the cache. Before 2026-09-09 every endpoint
+# below kept answering 200 with those cached values, so evcc had no way to know
+# it was flying blind.
+#
+# What that cost, 8-9 Sep 2026: session died 16:10:45, last good refresh 16:06:34.
+# /soc kept returning 70% for 14 h while the car was actually at 58.9%. evcc
+# concluded "limitSoc reached", stopped managing the loadpoint, and could not
+# issue stop commands either (they failed the same silent way). The car resumed
+# on its own schedule at 48 A / ~11 kW at 06:00 and had to be stopped by hand.
+#
+# A 503 is strictly better than a confident wrong number: evcc treats the
+# vehicle/charger as unavailable and does not act on fiction.
+STALE_AFTER = max(900, config.cache_ttl * 3)
+
+
+def _data_age():
+    """Seconds since the last SUCCESSFUL vehicle-state refresh."""
+    return time.time() - _last_refresh
+
+
+def _is_stale():
+    return _data_age() > STALE_AFTER
+
+
+def _stale_response():
+    age = round(_data_age())
+    logger.warning(
+        'Refusing request: vehicle data is %ds old (limit %ds). The Rivian '
+        'session has probably expired - re-run RivianSessionInitOTP.py.',
+        age, STALE_AFTER)
+    return jsonify({
+        'error': 'Rivian data stale - session probably expired',
+        'last_refresh_ago_seconds': age,
+        'stale_after_seconds': STALE_AFTER,
+    }), 503
+
+# ---------------------------------------------------------------------------
 # Background vehicle-state refresh
 # ---------------------------------------------------------------------------
 
@@ -78,32 +118,49 @@ def _background_refresher():
 threading.Thread(target=_background_refresher, daemon=True).start()
 
 # ---------------------------------------------------------------------------
-# Background noon job — shifts the off-peak disable window to 6AM
+# Background job — keeps the off-peak disable window at least 6 h away
 # ---------------------------------------------------------------------------
 
 def _noon_window_shifter():
     """
-    Polls every minute. Once per day, after noon, if charging is currently
-    disabled (off-peak window), re-applies the disable schedule so the window
-    shifts to 6AM rather than 6PM, preventing accidental evening charging.
-    Polling avoids missing the noon trigger when the system was asleep.
+    Polls every minute. Twice per day — first tick after midnight and first
+    tick after noon — if charging is currently disabled (off-peak window),
+    re-applies the disable schedule. set_charge_amps(0) places the window at
+    18:00 before noon and 06:00 after noon, so it is always >= 6 h away.
+    Without the midnight flip, a window parked at 06:00 in the afternoon fires
+    the next morning (CB-3).
+
+    A half-day is only marked done once the window has been written (or
+    charging is active and nothing needs moving), so a failure is retried on
+    the next tick (C-027). Polling also avoids missing a trigger when the
+    system was asleep.
     """
-    last_shift_date = None
+    last_done = None
     while True:
         time.sleep(60)
         now = datetime.now()
-        if now.hour >= 12 and now.date() != last_shift_date:
-            last_shift_date = now.date()
-            logger.info('Noon window shifter: checking if disable window needs shifting...')
-            with _refresh_lock:
-                try:
-                    if rivian.get_current_amps() == 0:
-                        logger.info('Noon window shifter: charging disabled — shifting window to 6AM')
-                        rivian.set_charge_amps(0)
-                    else:
-                        logger.info('Noon window shifter: charging active — no action needed')
-                except Exception as e:
-                    logger.error('Noon window shifter failed: %s', e)
+        half_day = (now.date(), now.hour >= 12)
+        if half_day == last_done:
+            continue
+        target = '6AM' if now.hour >= 12 else '6PM'
+        logger.info('Window shifter: checking if disable window needs moving to %s...', target)
+        with _refresh_lock:
+            try:
+                # A failed read would look like "disabled" to get_current_amps()
+                # and trigger a write with an empty location (E-003). Retry instead.
+                if rivian.get_schedules() is None:
+                    logger.error('Window shifter: schedule read failed — will retry')
+                    continue
+                if rivian.get_current_amps() != 0:
+                    logger.info('Window shifter: charging active — no action needed')
+                    last_done = half_day
+                elif rivian.set_charge_amps(0):
+                    logger.info('Window shifter: disable window moved to %s', target)
+                    last_done = half_day
+                else:
+                    logger.error('Window shifter: write failed — will retry')
+            except Exception as e:
+                logger.error('Window shifter failed: %s — will retry', e)
 
 
 threading.Thread(target=_noon_window_shifter, daemon=True).start()
@@ -114,10 +171,24 @@ threading.Thread(target=_noon_window_shifter, daemon=True).start()
 
 app = Flask(__name__)
 
+# The bridge listens on all interfaces because HA reads /health over the LAN, but the
+# write endpoints start/stop charging and set amps. Only evcc (same machine) may call them.
+LOCAL_ADDRS = {'127.0.0.1', '::1'}
+
+
+@app.before_request
+def _writes_local_only():
+    if request.method != 'GET' and request.remote_addr not in LOCAL_ADDRS:
+        logger.warning('Rejected %s %s from %s (writes are localhost-only)',
+                       request.method, request.path, request.remote_addr)
+        return jsonify({'error': 'writes are only accepted from localhost'}), 403
+
 # ── Vehicle plugin endpoints ─────────────────────────────────────────────────
 
 @app.get('/soc')
 def soc():
+    if _is_stale():
+        return _stale_response()
     value = rivian.get_soc()
     if value is None:
         return jsonify({'error': 'SoC not available'}), 503
@@ -126,11 +197,15 @@ def soc():
 
 @app.get('/status')
 def status():
+    if _is_stale():
+        return _stale_response()
     return rivian.get_evcc_status()
 
 
 @app.get('/range')
 def range_km():
+    if _is_stale():
+        return _stale_response()
     value = rivian.get_range_km()
     if value is None:
         return jsonify({'error': 'Range not available'}), 503
@@ -142,12 +217,16 @@ def range_km():
 @app.get('/charger/status')
 def charger_status():
     """Same IEC 61851 status used for vehicle, also serves as charger status."""
+    if _is_stale():
+        return _stale_response()
     return rivian.get_evcc_status()
 
 
 @app.get('/charger/enabled')
 def charger_enabled():
     """True if a 24-hour charging schedule is currently active."""
+    if _is_stale():
+        return _stale_response()
     amps = rivian.get_current_amps()
     return 'true' if amps >= rivian.AMPS_MIN else 'false'
 
@@ -155,6 +234,8 @@ def charger_enabled():
 @app.get('/charger/current')
 def charger_current():
     """Return current schedule amperage (0 if disabled)."""
+    if _is_stale():
+        return _stale_response()
     return str(rivian.get_current_amps())
 
 
@@ -165,6 +246,8 @@ def charger_enable():
     Body: plain text "true" or "false"
     EVCC sends the raw boolean value as the request body.
     """
+    if _is_stale():
+        return _stale_response()
     body = request.get_data(as_text=True).strip().lower()
     enabled = body == 'true'
     logger.info('charger/enable called: enabled=%s', enabled)
@@ -179,6 +262,8 @@ def set_charger_current():
     Body: plain integer amps (e.g. "16")
     EVCC sends the raw integer value as the request body.
     """
+    if _is_stale():
+        return _stale_response()
     body = request.get_data(as_text=True).strip()
     try:
         amps = int(float(body))
@@ -195,14 +280,16 @@ def set_charger_current():
 @app.get('/health')
 def health():
     return jsonify({
-        'status': 'ok',
+        'status': 'stale' if _is_stale() else 'ok',
+        'stale': _is_stale(),
         'soc': rivian.get_soc(),
         'evcc_status': rivian.get_evcc_status(),
         'range_km': rivian.get_range_km(),
         'rivian_charging_status': rivian.charging_status,
         'charger_enabled': rivian.get_current_amps() >= rivian.AMPS_MIN,
         'charger_current_amps': rivian.get_current_amps(),
-        'last_refresh_ago_seconds': round(time.time() - _last_refresh),
+        'last_refresh_ago_seconds': round(_data_age()),
+        'stale_after_seconds': STALE_AFTER,
     })
 
 

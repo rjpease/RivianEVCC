@@ -16,7 +16,7 @@ LOG_DIR="$HOME/Library/Logs/rivian-evcc-bridge"
 if [ ! -f "$BRIDGE_DIR/config.json" ]; then
   echo "ERROR: rivian_bridge/config.json not found."
   echo "Copy config-example.json and fill in your credentials:"
-  echo "  cp config-example.json rivian_bridge/config.json"
+  echo "  cp rivian_bridge/config-example.json rivian_bridge/config.json"
   exit 1
 fi
 
@@ -83,7 +83,7 @@ echo ""
 echo "✓ Rivian EVCC Bridge installed and started."
 echo ""
 echo "Check logs at: $LOG_DIR/"
-echo "Test with:     curl http://localhost:7070/health"
+echo "Test with:     curl http://localhost:7071/health"
 echo ""
 echo "To stop:   launchctl unload $PLIST_DEST"
 echo "To start:  launchctl load   $PLIST_DEST"

@@ -1,0 +1,27 @@
+# Never let credentials or session tokens reach an image layer.
+# config.json and rivian-session.json are supplied at runtime via the
+# docker-compose volume mounts, not baked into the image.
+config.json
+rivian-session.json
+**/config.json
+**/rivian-session.json
+.env
+
+# Not needed at runtime
+.git
+.gitignore
+.claude
+tests
+README.md
+install-mac.sh
+docker-compose.yml
+*.yaml
+RivianSessionInitOTP.py
+
+# Build noise
+__pycache__
+**/__pycache__
+*.pyc
+.pytest_cache
+.venv
+.DS_Store
